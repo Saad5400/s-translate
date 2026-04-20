@@ -1,0 +1,16 @@
+.venv
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+*.egg-info/
+build/
+dist/
+tests/fixtures/
+/tmp/
+.claude/
+.idea/
+node_modules/
+dist/
+*.tsbuildinfo
