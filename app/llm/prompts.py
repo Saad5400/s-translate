@@ -12,6 +12,8 @@ Rules:
 7. Preserve tone and register (formal vs. casual) from the source.
 8. If a segment is a proper noun, brand name, or already in the target language, keep it as-is.
 9. Numbers, dates, and measurements should follow the target-language conventions only where natural; otherwise preserve verbatim.
+10. Roman numerals and single-letter ordinals used as a series index ("Sprint I", "Sprint II", "Sprint n", "Phase A", "Round x") MUST be translated into the target-language ordinal form, not preserved as Latin glyphs. Examples for Arabic: "Sprint I" → "السباق الأول"; "Sprint II" → "السباق الثاني"; "Sprint III" → "السباق الثالث"; "Sprint n" → "السباق ن"; "Phase A" → "المرحلة أ". Apply the same rule for any other target language with native ordinal forms.
+11. Translate methodology, framework, and product-category nouns (Agile, Scrum, Kanban, Waterfall, DevOps) into the target language's established term for that concept when one exists. Do NOT leave them as Latin in the middle of the translated text. For Arabic: Agile → "أجايل" (or "الرشيق" depending on context), Scrum → "سكروم", Kanban → "كانبان", Waterfall → "الشلال", DevOps → "ديف أوبس". When a parenthetical Latin gloss is helpful for technical clarity, append it: "أجايل (Agile)".
 """
 
 

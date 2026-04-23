@@ -92,7 +92,48 @@ class PdfTranslator(Translator):
         # single paragraph so the translator gets the full sentence context and
         # the translated text flows naturally (critical for RTL languages where
         # splitting a sentence mid-thought breaks word order).
+        segments = _drop_ocr_noise(segments)
+        segments = _merge_horizontal_tokens(segments)
         segments = _merge_vertical_paragraphs(segments)
+        # Wordmarks rendered as two stacked OCR lines (think the
+        # "WATERFALL\nMODEL" two-line bug logo on a slide) come out
+        # of OCR as separate segments because their bboxes barely
+        # overlap and the paragraph merger treats them as distinct
+        # paragraphs. Translating them in isolation produces two
+        # disconnected Arabic words that visually collide on the
+        # output. Merge such stacked short headings into one segment
+        # so the LLM sees the compound phrase and the renderer treats
+        # the result as a single stacked-title block.
+        segments = _merge_stacked_wordmarks(segments)
+
+        # Detect rotated text on rasterized pages. ocrmypdf's default page
+        # segmentation only picks up ONE dominant orientation per page, so
+        # a page mixing horizontal body text with a vertical wordmark (e.g.
+        # the "AGILE" label on the DevOps sprint diagram) loses every
+        # non-horizontal string — or worse, mis-OCRs it as garbage
+        # horizontal text ("SCRUM" → "INMYDS") that sits on the text layer
+        # pretending to be real content. Re-open the source PDF, render
+        # each rasterized page to an image, rotate it 90°/270°, OCR the
+        # rotated raster, and add any high-confidence rotated hits as new
+        # Segments. Then cull existing NON-rotated segments that overlap
+        # a rotated detection (the horizontal version is almost certainly
+        # the garbage from ocrmypdf's mis-orientation).
+        doc2 = pymupdf.open(str(src_path))
+        try:
+            next_id = len(segments)
+            for page_i, page in enumerate(doc2):
+                if not _is_rasterized_page(page):
+                    continue
+                rotated = _detect_rotated_text_on_page(page, next_id)
+                if rotated:
+                    segments = _cull_overlapping_horizontal(segments, rotated)
+                    segments.extend(rotated)
+                    next_id += len(rotated)
+        finally:
+            doc2.close()
+        # Re-assign sequential IDs so the LLM JSON stays tidy.
+        for i, seg in enumerate(segments):
+            seg.id = f"b{i}"
         return segments
 
     def reinsert(
@@ -177,6 +218,258 @@ class PdfTranslator(Translator):
         return out_path
 
 
+def _merge_stacked_wordmarks(segments: list[Segment]) -> list[Segment]:
+    """Combine vertically-overlapping (or nearly-touching) short
+    headings that share a font-size class into one segment with an
+    internal newline. Two ≤2-word segments whose bboxes vertically
+    overlap or sit within ~25% of a line-height of each other and use a
+    font ≥1.5× the page's body size are almost always a multi-line
+    wordmark (a logo or hero title typeset on two lines). Translating
+    them as one merged segment lets the LLM produce a coherent
+    compound phrase instead of two disconnected words, and lets the
+    renderer's stacked-title path place them with consistent spacing
+    instead of relying on the source's overlapping bboxes.
+    """
+    if len(segments) <= 1:
+        return segments
+
+    by_page: dict[int, list[Segment]] = {}
+    for seg in segments:
+        by_page.setdefault(seg.meta.get("page", 0), []).append(seg)
+
+    merged_all: list[Segment] = []
+    for _, page_segs in sorted(by_page.items()):
+        # Median font size for this page — anything 1.5× this size and
+        # short is treated as a wordmark candidate.
+        sizes = [
+            float(s.meta.get("font_size", 11.0) or 11.0) for s in page_segs
+        ]
+        sizes_sorted = sorted(sizes)
+        median = sizes_sorted[len(sizes_sorted) // 2] if sizes_sorted else 11.0
+        big_threshold = max(20.0, 1.5 * median)
+        page_segs_sorted = sorted(
+            page_segs,
+            key=lambda s: (
+                s.meta.get("bbox", [0, 0, 0, 0])[1],
+                s.meta.get("bbox", [0, 0, 0, 0])[0],
+            ),
+        )
+        used = [False] * len(page_segs_sorted)
+        for i, s in enumerate(page_segs_sorted):
+            if used[i]:
+                continue
+            if s.meta.get("rotation"):
+                merged_all.append(s)
+                used[i] = True
+                continue
+            sb = s.meta.get("bbox")
+            if not sb or float(s.meta.get("font_size", 11.0) or 11.0) < big_threshold:
+                merged_all.append(s)
+                used[i] = True
+                continue
+            if len(s.text.split()) > 2:
+                merged_all.append(s)
+                used[i] = True
+                continue
+            cur = s
+            used[i] = True
+            for j in range(i + 1, len(page_segs_sorted)):
+                if used[j]:
+                    continue
+                nxt = page_segs_sorted[j]
+                if nxt.meta.get("rotation"):
+                    continue
+                if len(nxt.text.split()) > 2:
+                    continue
+                if float(nxt.meta.get("font_size", 11.0) or 11.0) < big_threshold:
+                    continue
+                cb = nxt.meta.get("bbox")
+                if not cb:
+                    continue
+                cur_bb = cur.meta["bbox"]
+                line_h = max(
+                    float(cur.meta.get("font_size", 11.0) or 11.0),
+                    float(nxt.meta.get("font_size", 11.0) or 11.0),
+                )
+                # Vertical proximity: overlap or gap <= 0.4 × line height
+                vertical_gap = cb[1] - cur_bb[3]
+                if vertical_gap > 0.4 * line_h:
+                    # rows are sorted by y, so no later seg can be closer
+                    if vertical_gap > line_h:
+                        break
+                    continue
+                # Horizontal proximity: their x-ranges should overlap
+                # (stacked, not side-by-side).
+                ox = min(cur_bb[2], cb[2]) - max(cur_bb[0], cb[0])
+                if ox <= 0:
+                    continue
+                # Font size match within 25%
+                avg = (
+                    float(cur.meta.get("font_size", 11.0) or 11.0)
+                    + float(nxt.meta.get("font_size", 11.0) or 11.0)
+                ) / 2.0
+                if abs(
+                    float(cur.meta.get("font_size", 11.0) or 11.0)
+                    - float(nxt.meta.get("font_size", 11.0) or 11.0)
+                ) > 0.25 * avg:
+                    continue
+                # Merge: union bbox, text joined with \n.
+                union = [
+                    min(cur_bb[0], cb[0]),
+                    min(cur_bb[1], cb[1]),
+                    max(cur_bb[2], cb[2]),
+                    max(cur_bb[3], cb[3]),
+                ]
+                new_meta = dict(cur.meta)
+                new_meta["bbox"] = union
+                new_meta["font_size"] = avg
+                cur = Segment(
+                    id=cur.id,
+                    text=f"{cur.text}\n{nxt.text}",
+                    meta=new_meta,
+                )
+                used[j] = True
+            merged_all.append(cur)
+    # Renumber IDs.
+    for i, seg in enumerate(merged_all):
+        seg.id = f"b{i}"
+    return merged_all
+
+
+def _drop_ocr_noise(segments: list[Segment]) -> list[Segment]:
+    """Remove segments that are clearly OCR noise — tiny fragments whose
+    text is dominated by punctuation/symbols, typically tesseract
+    hallucinating letters in photo pixels. Keeps segments whose text
+    has at least 2 alphanumeric characters OR looks like a legitimate
+    short token (all-uppercase abbreviation, single digit with unit…).
+    """
+    out: list[Segment] = []
+    for seg in segments:
+        raw = seg.text or ""
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        alnum = sum(1 for c in stripped if c.isalnum())
+        # One alnum is OK for single digits ("2", "5%"); zero is always noise.
+        if alnum == 0:
+            continue
+        # Heavy-symbol segments: mostly non-letters/non-digits,
+        # length <= 6 — tesseract garbage on photo pixels.
+        if len(stripped) <= 6 and alnum / len(stripped) < 0.5:
+            continue
+        # Tiny mostly-non-ASCII fragments are almost always tesseract
+        # hallucinating glyphs in photo pixels (e.g. ``للري`` / ``كرا``
+        # appearing inside a stock photo of monitors). Drop them so they
+        # don't get translated and rendered as floating text.
+        if len(stripped) <= 6:
+            ascii_alpha = sum(1 for c in stripped if c.isascii() and c.isalpha())
+            if ascii_alpha == 0:
+                continue
+        # Single-letter segments at sub-readable font sizes are OCR
+        # imagining a glyph in a graphic detail; drop.
+        font_pt = float(seg.meta.get("font_size", 11.0) or 11.0)
+        if len(stripped) <= 1 and font_pt < 8.0:
+            continue
+        out.append(seg)
+    return out
+
+
+def _merge_horizontal_tokens(segments: list[Segment]) -> list[Segment]:
+    """Merge horizontally-adjacent tiny tokens on the same baseline into
+    one segment. OCR frequently splits short captions like ``Sprint I``
+    into two separate blocks (``Sprint`` + ``I``) which later get
+    translated independently and land at subtly-different mirrored
+    positions — producing the "floating الأول above the paragraph" bug
+    the reviewer flagged on the agile-iteration page.
+
+    A pair is merged when:
+      * same page and same row (y-ranges overlap >=70%),
+      * horizontal gap <= 0.6 × max font size (one-space worth),
+      * matching font size/weight/style,
+      * neither has a bullet leading marker.
+    """
+    if len(segments) <= 1:
+        return segments
+    by_page: dict[int, list[Segment]] = {}
+    for seg in segments:
+        by_page.setdefault(seg.meta.get("page", 0), []).append(seg)
+    merged_all: list[Segment] = []
+    for _, page_segs in sorted(by_page.items()):
+        page_segs.sort(
+            key=lambda s: (
+                s.meta.get("bbox", [0, 0, 0, 0])[1],
+                s.meta.get("bbox", [0, 0, 0, 0])[0],
+            ),
+        )
+        used = [False] * len(page_segs)
+        for i, s in enumerate(page_segs):
+            if used[i]:
+                continue
+            sb = s.meta.get("bbox")
+            if not sb:
+                merged_all.append(s)
+                used[i] = True
+                continue
+            # Try to absorb the next segment on the same row.
+            cur = s
+            used[i] = True
+            for j in range(i + 1, len(page_segs)):
+                if used[j]:
+                    continue
+                nxt = page_segs[j]
+                nb = nxt.meta.get("bbox")
+                if not nb:
+                    continue
+                if _y_overlap_fraction(sb, nb) < 0.7:
+                    # rows are sorted by y, so once row changes we're done
+                    if nb[1] > sb[3]:
+                        break
+                    continue
+                avg_size = (
+                    float(cur.meta.get("font_size", 11.0))
+                    + float(nxt.meta.get("font_size", 11.0))
+                ) / 2.0
+                gap = nb[0] - sb[2]
+                if gap < -2 or gap > max(6.0, 0.6 * avg_size):
+                    continue
+                if bool(cur.meta.get("bold")) != bool(nxt.meta.get("bold")):
+                    continue
+                if bool(cur.meta.get("italic")) != bool(nxt.meta.get("italic")):
+                    continue
+                if nxt.meta.get("bullet"):
+                    continue
+                # Skip the font-size match when EITHER side is a tiny
+                # token (≤2 characters) — tesseract estimates font size
+                # from glyph height, which is unreliable for thin
+                # letters like "I" (7pt) next to "Sprint" (17pt). The
+                # x-gap and same-row tests already guard against bogus
+                # joins.
+                if (
+                    len(cur.text.strip()) > 2
+                    and len(nxt.text.strip()) > 2
+                    and abs(
+                        float(cur.meta.get("font_size", 11.0))
+                        - float(nxt.meta.get("font_size", 11.0))
+                    ) > max(1.0, 0.18 * avg_size)
+                ):
+                    continue
+                union = [
+                    min(sb[0], nb[0]), min(sb[1], nb[1]),
+                    max(sb[2], nb[2]), max(sb[3], nb[3]),
+                ]
+                new_meta = dict(cur.meta)
+                new_meta["bbox"] = union
+                cur = Segment(
+                    id=cur.id,
+                    text=f"{cur.text} {nxt.text}",
+                    meta=new_meta,
+                )
+                sb = union
+                used[j] = True
+            merged_all.append(cur)
+    return merged_all
+
+
 def _merge_vertical_paragraphs(segments: list[Segment]) -> list[Segment]:
     """Merge adjacent vertically-stacked segments on the same page that share
     left margin, font size, weight and style — they are almost always one
@@ -242,11 +535,17 @@ def _should_merge_vertical(prev: Segment, curr: Segment) -> bool:
     # ~1.6 line heights so a full paragraph break (blank line) is preserved.
     if y_gap < -0.5 * avg_size or y_gap > 1.6 * avg_size:
         return False
-    # Width should be in the same ballpark — a caption line under a body
-    # paragraph tends to be dramatically narrower; keep them separate.
+    # A paragraph's LAST line is routinely much narrower than the
+    # preceding full-width lines — "users." trailing "reached
+    # production…" is still the same paragraph, just a widow. Only
+    # reject when the PREVIOUS segment is dramatically narrower than
+    # the CURRENT one (prev is a caption, curr is a wide body about to
+    # start a new paragraph block). Allowing curr << prev restores the
+    # stray-last-word merge that showed up on p2 as a floating
+    # horizontal strip between two Arabic paragraphs.
     prev_w = pb[2] - pb[0]
     curr_w = cb[2] - cb[0]
-    if min(prev_w, curr_w) < 0.25 * max(prev_w, curr_w):
+    if prev_w < 0.25 * curr_w:
         return False
     return True
 
@@ -451,6 +750,185 @@ def _sample_bbox_fills(
         return [default] * len(segs)
 
 
+def _cull_overlapping_horizontal(segments, rotated_segs):
+    """Remove horizontal (rotation=0) segments whose bbox is majority-
+    contained within any rotated segment's bbox. Rotated OCR passes
+    stricter filters than ocrmypdf's default horizontal pass, so when
+    both produce hits for the same region the rotated one is kept."""
+    if not rotated_segs:
+        return segments
+    keep = []
+    for seg in segments:
+        if seg.meta.get("rotation"):
+            keep.append(seg)
+            continue
+        b = seg.meta.get("bbox")
+        if not b:
+            keep.append(seg)
+            continue
+        b_area = max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+        dominated = False
+        for r in rotated_segs:
+            if r.meta.get("page") != seg.meta.get("page"):
+                continue
+            rb = r.meta["bbox"]
+            ix0 = max(b[0], rb[0]); iy0 = max(b[1], rb[1])
+            ix1 = min(b[2], rb[2]); iy1 = min(b[3], rb[3])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            if inter / b_area > 0.5:
+                dominated = True
+                break
+        if not dominated:
+            keep.append(seg)
+    return keep
+
+
+def _detect_rotated_text_on_page(page, start_id: int) -> list:
+    """OCR the page image at 90° and 270° rotations to catch vertical text
+    that horizontal OCR missed (labels on diagrams, marginalia, tall brand
+    marks). Returns new Segments with ``meta['rotation']`` set to 90 or 270
+    and bbox in PDF point coords aligned to the source page orientation.
+
+    90° means the source text is rotated 90° counter-clockwise from
+    horizontal — i.e. reads bottom-to-top (the usual spine-direction label
+    on Western book covers). 270° means clockwise — reads top-to-bottom.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return []
+
+    page_w_pt = float(page.rect.width)
+    page_h_pt = float(page.rect.height)
+    if page_w_pt <= 0 or page_h_pt <= 0:
+        return []
+    dpi = 200
+    scale = dpi / 72.0
+    try:
+        pix = page.get_pixmap(dpi=dpi, alpha=False, annots=False)
+        base = Image.frombytes("RGB", (pix.w, pix.h), pix.samples)
+    except Exception:
+        return []
+    W, H = base.size  # original image dimensions in pixels
+
+    # Note: we deliberately do NOT filter against existing horizontal
+    # segments here. ocrmypdf's default OCR pass runs with a single
+    # horizontal orientation, so it often produces GARBAGE text for
+    # rotated glyphs (e.g. "SCRUM" → "INMYDS") that sits in the same
+    # bbox. Rejecting a rotated hit because that garbage exists would
+    # discard the correct detection. Instead, the caller post-culls
+    # non-rotated segments that overlap a rotated one.
+
+    results: list[Segment] = []
+    counter = start_id
+    for angle in (90, 270):
+        rotated = base.rotate(angle, expand=True, fillcolor=(255, 255, 255))
+        try:
+            data = pytesseract.image_to_data(
+                rotated, config="--psm 11", output_type=pytesseract.Output.DICT,
+            )
+        except Exception:
+            continue
+        # Group word-level detections into line-level clusters so "AGILE"
+        # spanning multiple word boxes still ends up as a single Segment.
+        lines_map: dict[tuple, list[int]] = {}
+        for i, txt in enumerate(data.get("text", [])):
+            if not txt or not txt.strip():
+                continue
+            try:
+                conf = float(data.get("conf", [-1])[i])
+            except Exception:
+                conf = -1.0
+            if conf < 78:
+                continue
+            stripped = txt.strip()
+            if len(stripped) < 3:
+                continue
+            alnum = sum(1 for c in stripped if c.isalnum())
+            if alnum < 3 or alnum / len(stripped) < 0.7:
+                continue
+            key = (
+                int(data["block_num"][i]),
+                int(data["par_num"][i]),
+                int(data["line_num"][i]),
+            )
+            lines_map.setdefault(key, []).append(i)
+        for indices in lines_map.values():
+            words: list[str] = []
+            ru0 = rv0 = float("inf")
+            ru1 = rv1 = float("-inf")
+            for i in indices:
+                words.append(data["text"][i].strip())
+                ru_, rv_ = int(data["left"][i]), int(data["top"][i])
+                rw_, rh_ = int(data["width"][i]), int(data["height"][i])
+                ru0, rv0 = min(ru0, ru_), min(rv0, rv_)
+                ru1, rv1 = max(ru1, ru_ + rw_), max(rv1, rv_ + rh_)
+            if ru0 == float("inf"):
+                continue
+            text = " ".join(words).strip()
+            if len(text) < 3:
+                continue
+            # Un-rotate bbox from rotated-image coords to base-image coords.
+            # Rotation reference (empirically verified):
+            #   90° CCW : (u,v) → (W-1-v, u)    (W = base width before rotate)
+            #   270° CCW: (u,v) → (v, H-1-u)    (H = base height before rotate)
+            if angle == 90:
+                bx0 = W - rv1
+                by0 = ru0
+                bx1 = W - rv0
+                by1 = ru1
+            else:
+                bx0 = rv0
+                by0 = H - ru1
+                bx1 = rv1
+                by1 = H - ru0
+            bx0 = max(0, bx0); by0 = max(0, by0)
+            bx1 = min(W, bx1); by1 = min(H, by1)
+            w_px = bx1 - bx0
+            h_px = by1 - by0
+            if w_px < 6 or h_px < 6:
+                continue
+            # Rotated 90°/270° text must be TALLER than wide in page
+            # coordinates. Reject any hit whose bbox is horizontal —
+            # those are almost always tesseract mis-parses of horizontal
+            # content reached through the rotation path.
+            if h_px < 1.3 * w_px:
+                continue
+            # Convert to PDF point coordinates.
+            bbox_pt = [bx0 / scale, by0 / scale, bx1 / scale, by1 / scale]
+            # Estimate source font size in points from the SHORT dimension
+            # of the rotated text (which was the line height before
+            # rotation). A generous 0.9× of that height approximates the
+            # glyph size in points.
+            short_px = min(by1 - by0, bx1 - bx0)
+            font_pt = max(8.0, (short_px / scale) * 0.9)
+            # Label convention: ``rotation`` is how far CCW the SOURCE text
+            # is from horizontal. We found it by rotating the image by
+            # ``angle`` CCW; the source orientation that un-rotates to
+            # horizontal is the opposite — ``360 - angle``.
+            source_rotation = (360 - angle) % 360
+            results.append(Segment(
+                id=f"b{counter}",
+                text=text,
+                meta={
+                    "page": page.number,
+                    "bbox": bbox_pt,
+                    "font_size": font_pt,
+                    "rotation": source_rotation,
+                    "bullet": "",
+                    "bold": False,
+                    "italic": False,
+                    "color": 0,
+                    "block_idx": -1,
+                },
+            ))
+            counter += 1
+    return results
+
+
 def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 200) -> None:
     """Render the page to a PIL image, paint translated text onto it using
     a real Arabic font + proper shaping, then REPLACE the page's content with
@@ -529,6 +1007,29 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
         fill = local if local is not None else page_bg
         arr[iy0:iy1, ix0:ix1] = fill
 
+    # BEFORE flipping, capture any BAKED-IN Latin text regions that are
+    # NOT in our text segments — these are stylized labels inside
+    # diagrams (e.g. "Build"/"Design" in the sprint circles) that
+    # ocrmypdf did not pick up. A naive full-page flip would render
+    # these as reversed glyphs ("dliuB"/"ngiseD"), which is unreadable
+    # and flagged by review as a blocker. We preserve the region
+    # contents so that after the page mirror we can paste them back
+    # UN-flipped at the mirrored coordinate, keeping the layout
+    # mirrored while local text stays readable.
+    baked_latin: list[tuple[int, int, int, int, "Image.Image"]] = []
+    if rtl:
+        # Rotated-text bboxes must be excluded from the un-flip set —
+        # they'll be re-drawn with translated Arabic on top, and pasting
+        # the original Latin glyph patch there would show through any
+        # transparent regions of the rotated-Arabic layer.
+        rotated_bboxes = [
+            box for seg, box in scaled_boxes
+            if int(seg.meta.get("rotation", 0) or 0)
+        ]
+        baked_latin = _collect_baked_latin_regions(
+            arr, text_mask, protected_bboxes=rotated_bboxes,
+        )
+
     img = Image.fromarray(arr)
 
     # Full-page RTL mirror. After this step every image, graphic, stair
@@ -537,6 +1038,10 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
     # a reading-order flip.
     if rtl:
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        # Restore baked-in Latin patches UN-flipped at mirrored positions.
+        for rx0, ry0, rx1, ry1, patch in baked_latin:
+            mx0 = img_w - rx1
+            img.paste(patch, (mx0, ry0))
 
     draw = ImageDraw.Draw(img)
     font_cache: dict[tuple[str, int, bool, bool], object] = {}
@@ -547,28 +1052,47 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
         bullet = seg.meta.get("bullet", "")
         if bullet:
             text = f"{bullet} {text}"
+        rotation = int(seg.meta.get("rotation", 0) or 0)
         if rtl:
-            # Mirror the bbox around the image's vertical centre line.
+            # Mirror the bbox around the image's vertical centre line. A
+            # horizontal page flip also flips rotation direction: 90° CCW
+            # becomes 270° CCW (and vice versa) when viewed in the mirror.
             mx0 = img_w - ix1
             mx1 = img_w - ix0
             ix0, ix1 = mx0, mx1
+            if rotation == 90:
+                rotation = 270
+            elif rotation == 270:
+                rotation = 90
 
         color = _int_to_rgb_tuple(seg.meta.get("color", 0))
         font_size = max(8, int(round(float(seg.meta.get("font_size", 11.0)) * scale)))
         bold = bool(seg.meta.get("bold"))
         italic = bool(seg.meta.get("italic"))
-        _draw_text_in_bbox(
-            draw,
-            text,
-            (ix0, iy0, ix1, iy1),
-            target_lang=target_lang,
-            rtl=rtl,
-            font_size=font_size,
-            color=color,
-            bold=bold,
-            italic=italic,
-            font_cache=font_cache,
-        )
+        if rotation in (90, 270):
+            _draw_rotated_text_in_bbox(
+                img, text, (ix0, iy0, ix1, iy1),
+                target_lang=target_lang, rtl=rtl,
+                font_size=font_size, color=color,
+                bold=bold, italic=italic,
+                font_cache=font_cache, rotation=rotation,
+            )
+            # Refresh Draw handle — pasting into img can invalidate the
+            # internal draw reference on some Pillow versions.
+            draw = ImageDraw.Draw(img)
+        else:
+            _draw_text_in_bbox(
+                draw,
+                text,
+                (ix0, iy0, ix1, iy1),
+                target_lang=target_lang,
+                rtl=rtl,
+                font_size=font_size,
+                color=color,
+                bold=bold,
+                italic=italic,
+                font_cache=font_cache,
+            )
 
     # Re-encode and replace the page content with this single image. JPEG
     # for photo-like pages, PNG for line-art/slides, so the output PDF
@@ -598,6 +1122,152 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
         page.insert_image(page_rect, stream=img_bytes, keep_proportion=False)
     except Exception as exc:
         log.warning("insert_image failed on page %d: %s", page.number, exc)
+
+
+def _collect_baked_latin_regions(arr, text_mask, protected_bboxes=None):
+    """Return rectangles (pixel coords) that contain baked-in LAYOUT-TEXT
+    (any text-shaped pixel blob) NOT already covered by an existing
+    translated segment. Used by the PIL render path to preserve baked-in
+    labels across an RTL page flip: we paste the UN-flipped crop back at
+    the mirrored position so the label stays readable.
+
+    Combines two detectors to maximise coverage:
+      - tesseract OCR on the page — catches legible Latin words that
+        ocrmypdf missed.
+      - morphological "text-like blob" detection on an adaptive binary
+        threshold of the page — catches stylised circle-interior labels
+        (the "Build"/"Design"/"Analyze" labels inside sprint diagrams)
+        that OCR cannot read but which are still text-shaped pixels that
+        would appear as reversed glyphs after a page flip.
+
+    The morphological pass is essential for diagram-heavy slides where
+    labels are rendered in ornamental fonts over coloured backgrounds
+    — OCR alone finds nothing, but the pixels are clearly text-shaped
+    and look awful when mirrored.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        pytesseract = None
+    import numpy as np
+    try:
+        import cv2
+    except Exception:
+        cv2 = None
+
+    h, w = arr.shape[:2]
+    candidates: list[tuple[int, int, int, int]] = []
+
+    if pytesseract is not None:
+        try:
+            img = Image.fromarray(arr)
+            data = pytesseract.image_to_data(
+                img, lang="eng", output_type=pytesseract.Output.DICT,
+            )
+        except Exception:
+            data = None
+        if data is not None:
+            for i, txt in enumerate(data.get("text", [])):
+                if not txt or not txt.strip():
+                    continue
+                try:
+                    conf = float(data.get("conf", [-1])[i])
+                except Exception:
+                    conf = -1.0
+                if conf < 55:
+                    continue
+                stripped = txt.strip()
+                alpha_ascii = sum(1 for c in stripped if c.isascii() and c.isalpha())
+                if alpha_ascii < 2:
+                    continue
+                try:
+                    x = int(data["left"][i]); y = int(data["top"][i])
+                    rw = int(data["width"][i]); rh = int(data["height"][i])
+                except Exception:
+                    continue
+                if rw < 6 or rh < 6:
+                    continue
+                candidates.append((x, y, x + rw, y + rh))
+
+    if cv2 is not None:
+        # Morphological text-line detection: adaptive binary threshold
+        # then horizontal dilation merges letters into word-sized blobs
+        # that we can filter by aspect ratio.
+        try:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            th = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY_INV, 15, 5,
+            )
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
+            dilated = cv2.dilate(th, kernel, iterations=2)
+            n, _, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+            for i in range(1, n):
+                x, y, rw, rh, _area = stats[i]
+                if rw < 15 or rh < 8:
+                    continue
+                if rw > 400 or rh > 60:
+                    continue
+                ar = rw / max(1, rh)
+                if ar < 1.0 or ar > 15:
+                    continue
+                candidates.append((x, y, x + rw, y + rh))
+        except Exception:
+            pass
+
+    regions: list[tuple[int, int, int, int, "Image.Image"]] = []
+    from PIL import Image as _Image
+    seen: list[tuple[int, int, int, int]] = []
+    for (x0, y0, x1, y1) in candidates:
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(w, x1); y1 = min(h, y1)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        sub = text_mask[y0:y1, x0:x1]
+        if sub.size and float(sub.sum()) / sub.size >= 0.5:
+            continue
+        # Protected bboxes: rotated-text regions that will be redrawn
+        # with translated Arabic. Never un-flip the source pixels
+        # there, otherwise the Latin original shows through any
+        # transparent area of the rotated-text alpha layer.
+        skip_protected = False
+        if protected_bboxes:
+            for px0, py0, px1, py1 in protected_bboxes:
+                ix0 = max(x0, px0); iy0 = max(y0, py0)
+                ix1 = min(x1, px1); iy1 = min(y1, py1)
+                if ix1 <= ix0 or iy1 <= iy0:
+                    continue
+                inter = (ix1 - ix0) * (iy1 - iy0)
+                area = (x1 - x0) * (y1 - y0)
+                if inter / max(1, area) > 0.25:
+                    skip_protected = True
+                    break
+        if skip_protected:
+            continue
+        # De-dupe overlapping candidates — OCR and morph often hit the
+        # same blob.
+        overlap = False
+        for sx0, sy0, sx1, sy1 in seen:
+            ix0 = max(x0, sx0); iy0 = max(y0, sy0)
+            ix1 = min(x1, sx1); iy1 = min(y1, sy1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            a = (x1 - x0) * (y1 - y0)
+            b = (sx1 - sx0) * (sy1 - sy0)
+            if inter / min(a, b) > 0.6:
+                overlap = True
+                break
+        if overlap:
+            continue
+        seen.append((x0, y0, x1, y1))
+        pad = max(2, int((y1 - y0) * 0.15))
+        x0p = max(0, x0 - pad); y0p = max(0, y0 - pad)
+        x1p = min(w, x1 + pad); y1p = min(h, y1 + pad)
+        patch = _Image.fromarray(arr[y0p:y1p, x0p:x1p].copy())
+        regions.append((x0p, y0p, x1p, y1p, patch))
+    return regions
 
 
 def _int_to_rgb_tuple(color_int) -> tuple[int, int, int]:
@@ -637,10 +1307,12 @@ def _load_pil_font(target_lang: str, size: int, bold: bool, italic: bool, cache:
     to avoid reloading per segment.
 
     Font priority for Arabic:
-      1. Cairo (modern geometric sans — matches the look of contemporary
-         Arabic UIs and paired Latin nicely)
-      2. Noto Sans Arabic (clean modern Arabic sans, has a Bold variant)
-      3. Noto Naskh Arabic (traditional Naskh fallback)
+      1. Cairo (variable font, modern geometric sans, covers BOTH Arabic AND
+         Latin scripts in a single file — essential for rendering mixed
+         Arabic+English text like "API" or "DevOps" without tofu squares).
+      2. Noto Sans Arabic (Arabic-only — picks up any Arabic glyph Cairo
+         happens to lack).
+      3. Noto Sans (Latin fallback).
     """
     from PIL import ImageFont
 
@@ -654,21 +1326,29 @@ def _load_pil_font(target_lang: str, size: int, bold: bool, italic: bool, cache:
     key = (code, size, bold, italic)
     if key in cache:
         return cache[key]
-    candidates: list[str] = []
     if code in arabic_codes:
-        if bold:
-            candidates.extend([
-                "NotoSansArabic-Bold.ttf",
-                "Cairo-Variable.ttf",
-                "NotoNaskhArabic-Bold.ttf",
-            ])
-        candidates.extend([
-            "NotoSansArabic-Regular.ttf",
-            "Cairo-Variable.ttf",
-            "NotoNaskhArabic-Regular.ttf",
-        ])
+        cairo_path = fonts_dir / "Cairo-Variable.ttf"
+        if cairo_path.exists():
+            try:
+                font = ImageFont.truetype(str(cairo_path), size)
+                try:
+                    font.set_variation_by_axes([700.0 if bold else 400.0])
+                except Exception:
+                    pass
+                cache[key] = font
+                return font
+            except Exception:
+                pass
+        # Cairo missing — fall back to Arabic-only Noto fonts (may show tofu
+        # on embedded Latin runs; that's the cost of the fallback path).
+        candidates = [
+            "NotoSansArabic-Bold.ttf" if bold else "NotoSansArabic-Regular.ttf",
+            "NotoNaskhArabic-Bold.ttf" if bold else "NotoNaskhArabic-Regular.ttf",
+        ]
     elif code in hebrew_codes:
-        candidates.append("NotoSansHebrew-Regular.ttf")
+        candidates = ["NotoSansHebrew-Regular.ttf"]
+    else:
+        candidates = []
     candidates.append("NotoSans-Regular.ttf")
     for name in candidates:
         path = fonts_dir / name
@@ -711,44 +1391,195 @@ def _draw_text_in_bbox(
     """
     x0, y0, x1, y1 = box
     box_w = max(1, x1 - x0)
-    box_h = max(1, y1 - y0)
     direction = "rtl" if rtl else "ltr"
     features = ["kern", "liga"]
     lang = _raqm_lang_for(target_lang)
 
-    forced_lines = text.split("\n")
-    size_options = [font_size] + [max(8, font_size - step) for step in (2, 4, 6, 8, 10)]
+    # Multi-line handling. The OCR paragraph-merger joins visual lines
+    # with ``\n`` so the LLM gets the whole paragraph as context. At
+    # render time, ``\n`` in a long paragraph is a SOFT break (just the
+    # source's physical line wrap) and must be re-flowed to the
+    # translated bbox width; but in a SHORT stacked title (e.g. a
+    # "WATERFALL\nMODEL" wordmark, where each line is 1-3 words) the
+    # break is INTENTIONAL and must be preserved — flattening stacked
+    # titles produces the "overlapping two-line blob" the reviewer
+    # flagged on the Waterfall page.
+    pieces = [p.strip() for p in text.split("\n") if p.strip()]
+    if not pieces:
+        return
+    # Stack only when EVERY line is a real multi-word phrase (≥2 words)
+    # AND each line is ≤3 words. A single-word line (e.g. "السباق" or
+    # "II") is almost never an intentional title break — it's the LLM
+    # adding a stray newline to a short caption like "Sprint II", which
+    # we then flatten into one line so the caption reads as a single
+    # phrase rather than two stacked words. True stacked wordmarks
+    # (e.g. "WATERFALL\nMODEL" → translated to two ≥2-word phrases)
+    # still preserve their break.
+    multiword_short = (
+        len(pieces) > 1
+        and all(2 <= len(p.split()) <= 3 for p in pieces)
+    )
+    if multiword_short:
+        forced_lines: list[str] = pieces
+    else:
+        forced_lines = [" ".join(pieces)]
+
+    # Size strategy: start at the segment's original font size. Only shrink
+    # when a single word overflows the bbox width (``_wrap_line`` returns
+    # None). NEVER shrink because the wrapped paragraph is taller than the
+    # source bbox — Arabic translations are often 20-30% taller than the
+    # English source and shrinking to fit produced the tiny unreadable text
+    # the user reported. The overflow lands in the whitespace below the
+    # source bbox, which was inpainted to background.
+    size_options = [font_size] + [max(10, font_size - step) for step in (1, 2, 3, 4, 6, 8)]
+    font = None
+    wrapped_lines: list[str] | None = None
+    box_h = max(1, y1 - y0)
+    # Allow vertical overflow up to 1.4× the source bbox height — Arabic
+    # at the same nominal pt size is often taller than Latin, and a
+    # rigid box-fit produces unreadable shrunken text. Above 1.4× the
+    # rendered text would crash into the next paragraph below, so we
+    # progressively shrink the font until the wrapped paragraph fits
+    # within that overflow budget.
+    overflow_budget = box_h * 1.4
     for size in size_options:
         font = _load_pil_font(target_lang, size, bold, italic, font_cache)
-        wrapped_lines: list[str] = []
-        fit = True
+        candidate: list[str] = []
+        ok = True
         for forced in forced_lines:
-            segs = _wrap_line(draw, forced, font, box_w, direction, features, lang)
-            if segs is None:
-                fit = False
+            segs_w = _wrap_line(draw, forced, font, box_w, direction, features, lang)
+            if segs_w is None:
+                ok = False
                 break
-            wrapped_lines.extend(segs)
-        if not fit:
+            candidate.extend(segs_w)
+        if not ok:
             continue
-        line_h = _line_height(font)
-        total_h = line_h * len(wrapped_lines)
-        if total_h <= box_h or size == size_options[-1]:
-            y = y0
-            for line in wrapped_lines:
-                tw = _text_width(draw, line, font, direction, features, lang)
-                x = x1 - tw if rtl else x0
-                try:
-                    draw.text(
-                        (x, y), line, font=font, fill=color,
-                        direction=direction, features=features, language=lang,
-                    )
-                except Exception:
-                    try:
-                        draw.text((x, y), line, font=font, fill=color)
-                    except Exception:
-                        pass
-                y += line_h
-            return
+        line_h_try = _line_height(font)
+        if line_h_try * len(candidate) <= overflow_budget or size == size_options[-1]:
+            wrapped_lines = candidate
+            break
+    if wrapped_lines is None:
+        font = _load_pil_font(target_lang, max(10, size_options[-1]), bold, italic, font_cache)
+        wrapped_lines = []
+        for forced in forced_lines:
+            wrapped_lines.extend(
+                _char_wrap(draw, forced, font, box_w, direction, features, lang)
+            )
+    if not wrapped_lines:
+        return
+    line_h = _line_height(font)
+    total_h = line_h * len(wrapped_lines)
+    # Vertically centre the rendered text inside the source bbox.
+    # If the wrapped content is taller than the bbox (common for Arabic
+    # which is often taller at the same pt size as Latin), start above
+    # the bbox top so overflow lands symmetrically above and below —
+    # this halves the chance that a single-line Arabic title collides
+    # with an adjacent title below it (the "الشلال over النموذج overlap"
+    # the reviewer flagged on the Waterfall page).
+    y = y0 + (box_h - total_h) // 2
+    for line in wrapped_lines:
+        tw = _text_width(draw, line, font, direction, features, lang)
+        x = x1 - tw if rtl else x0
+        try:
+            draw.text(
+                (x, y), line, font=font, fill=color,
+                direction=direction, features=features, language=lang,
+            )
+        except Exception:
+            try:
+                draw.text((x, y), line, font=font, fill=color)
+            except Exception:
+                pass
+        y += line_h
+    return
+
+
+def _draw_rotated_text_in_bbox(
+    page_img,
+    text: str,
+    box: tuple[int, int, int, int],
+    *,
+    target_lang: str,
+    rtl: bool,
+    font_size: int,
+    color: tuple[int, int, int],
+    bold: bool,
+    italic: bool,
+    font_cache: dict,
+    rotation: int,
+) -> None:
+    """Draw ``text`` into ``box`` ROTATED by ``rotation`` degrees CCW so it
+    matches the source page's vertical/marginalia text.
+
+    Implementation: draw the text horizontally into an off-screen
+    transparent image sized to the rotated bbox's SHORT dimension × LONG
+    dimension, then rotate that image by ``rotation`` (expand=True) and
+    alpha-paste into the page image at the bbox origin.
+    """
+    from PIL import Image, ImageDraw
+
+    x0, y0, x1, y1 = box
+    bw = max(1, x1 - x0)
+    bh = max(1, y1 - y0)
+    if rotation in (90, 270):
+        # When rotated, the horizontal canvas we draw on has dimensions
+        # swapped from the target bbox: it will be ROTATED into the bbox.
+        canvas_w, canvas_h = bh, bw
+    else:
+        canvas_w, canvas_h = bw, bh
+    # Vertical wordmarks should fill the column without wrapping.
+    # Search for the LARGEST font size that draws ``text`` as a SINGLE
+    # line whose width fits ``canvas_w`` AND whose height fits
+    # ``canvas_h``. Starting at canvas_h (max sensible font height)
+    # and stepping down keeps Arabic words at a similar visual weight
+    # to the source Latin wordmark — without this auto-fit, Arabic
+    # letters at the source's nominal pt size leave a thin word
+    # floating in an empty tall bbox.
+    if rotation in (90, 270):
+        layer_for_metrics = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        metrics_draw = ImageDraw.Draw(layer_for_metrics)
+        direction = "rtl" if rtl else "ltr"
+        features = ["kern", "liga"]
+        lang = _raqm_lang_for(target_lang)
+        best = font_size
+        # Start from the column's short dimension and walk down — most
+        # rotated bbox aspect ratios (e.g. 1:4 or 1:8 for a wordmark)
+        # leave large headroom on the long axis so the largest font
+        # that fits without wrapping is much bigger than the caller's
+        # source-pt-size hint.
+        upper = max(font_size, int(canvas_h * 1.5))
+        for trial in range(upper, max(font_size - 1, 8), -2):
+            test_font = _load_pil_font(target_lang, trial, bold, italic, font_cache)
+            try:
+                bbox = metrics_draw.textbbox(
+                    (0, 0), text, font=test_font,
+                    direction=direction, features=features, language=lang,
+                )
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+            except Exception:
+                tw = _text_width(metrics_draw, text, test_font, direction, features, lang)
+                th = _line_height(test_font)
+            if tw <= canvas_w and th <= canvas_h:
+                best = trial
+                break
+        font_size = best
+    layer = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    layer_draw = ImageDraw.Draw(layer)
+    _draw_text_in_bbox(
+        layer_draw, text, (0, 0, canvas_w, canvas_h),
+        target_lang=target_lang, rtl=rtl, font_size=font_size,
+        color=color, bold=bold, italic=italic, font_cache=font_cache,
+    )
+    rotated = layer.rotate(rotation, expand=True, resample=Image.BICUBIC)
+    # Centre the rotated layer on the bbox centre so small rotation-induced
+    # size mismatches don't nudge text out of place.
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+    rw, rh = rotated.size
+    paste_x = cx - rw // 2
+    paste_y = cy - rh // 2
+    page_img.paste(rotated, (paste_x, paste_y), rotated)
 
 
 def _raqm_lang_for(target_lang: str) -> str:
@@ -767,7 +1598,11 @@ def _raqm_lang_for(target_lang: str) -> str:
 def _line_height(font) -> int:
     try:
         ascent, descent = font.getmetrics()
-        return int(round((ascent + descent) * 1.15))
+        # Tight leading. A 1.15× multiplier made Arabic (already taller
+        # than Latin at the same pt size) overflow adjacent bboxes; 1.0
+        # matches visible glyph extent so stacked single-line titles no
+        # longer collide.
+        return int(round((ascent + descent) * 1.0))
     except Exception:
         return font.size if hasattr(font, "size") else 12
 
@@ -803,6 +1638,26 @@ def _wrap_line(draw, text: str, font, max_width: int, direction: str, features, 
         cur = [word]
     if cur:
         lines.append(" ".join(cur))
+    return lines
+
+
+def _char_wrap(draw, text: str, font, max_width: int, direction: str, features, lang: str):
+    """Last-resort wrapper: break at any character when even a single word is
+    wider than the bbox. Used for URLs / long tokens in narrow columns."""
+    if not text:
+        return [""]
+    lines: list[str] = []
+    cur = ""
+    for ch in text:
+        trial = cur + ch
+        if _text_width(draw, trial, font, direction, features, lang) <= max_width:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = ch
+    if cur:
+        lines.append(cur)
     return lines
 
 

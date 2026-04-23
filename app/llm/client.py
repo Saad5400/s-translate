@@ -261,10 +261,66 @@ class LLMClient:
         for seg in chunk:
             translated = parsed.get(seg.id)
             if isinstance(translated, str) and translated:
-                seg.translated = translated
+                seg.translated = _normalize_target_text(translated, target_lang)
             else:
                 log.warning("segment %s missing in response; keeping original", seg.id)
                 seg.translated = seg.meta.get("_original_text", seg.text)
+
+
+_ARABIC_ROMAN_ORDINAL = {
+    "I": "الأول", "II": "الثاني", "III": "الثالث", "IV": "الرابع",
+    "V": "الخامس", "VI": "السادس", "VII": "السابع", "VIII": "الثامن",
+    "IX": "التاسع", "X": "العاشر",
+    # ocrmypdf frequently misreads "II" as "Il", "III" as "Ill" when
+    # the second I is rendered with a slight serif. Map those too so
+    # the post-translation normaliser still hits.
+    "Il": "الثاني", "Ill": "الثالث",
+}
+
+
+def _normalize_target_text(text: str, target_lang: str) -> str:
+    """Post-process LLM output for the target language.
+
+    For Arabic translations, replace stray Latin Roman-numeral / single-
+    letter ordinals that the LLM left in the middle of an Arabic string
+    with their Arabic equivalents. The system prompt explicitly forbids
+    this behaviour but providers sometimes still leak the original
+    Latin token (especially when the source had OCR typos like ``Sprint
+    Il`` instead of ``Sprint II``). Also collapses internal newlines in
+    very short Arabic captions where the LLM split a phrase like
+    ``Sprint II`` across two lines.
+    """
+    import re
+
+    from ..lang.rtl import normalize as _norm_lang
+
+    if not text:
+        return text
+    code = _norm_lang(target_lang)
+    if code != "ar":
+        return text
+
+    out = text
+    # Replace " I" / " II" / " Il" etc. when preceded by Arabic content.
+    def _sub(match: "re.Match") -> str:
+        token = match.group(2)
+        replacement = _ARABIC_ROMAN_ORDINAL.get(token, token)
+        return f"{match.group(1)} {replacement}"
+
+    arabic_run = r"[؀-ۿݐ-ݿ]+"
+    pattern = re.compile(
+        rf"({arabic_run})[\s\n]+([IVX]+|Il|Ill|n)\b"
+    )
+    out = pattern.sub(_sub, out)
+
+    # Collapse newlines in very short captions (≤ ~25 chars) — these
+    # are almost always the LLM splitting a single short phrase across
+    # two lines, and rendering them stacked produces a fragmented
+    # caption. Multi-line bodies / wordmarks longer than this stay
+    # untouched.
+    if len(out) <= 25 and "\n" in out:
+        out = " ".join(part.strip() for part in out.split("\n") if part.strip())
+    return out
 
 
 def _sample_segments_excerpt(segments: list[Segment], max_chars: int = 6000) -> str:
