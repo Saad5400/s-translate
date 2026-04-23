@@ -21,9 +21,11 @@ import {
 import {
   createJob,
   getJob,
+  getJobPreview,
   listJobs,
   pollJob,
   type JobMeta,
+  type JobPreview,
 } from "@/lib/api";
 import { findShape, LANGUAGES } from "@/lib/data";
 
@@ -63,8 +65,11 @@ function AppInner() {
   const [jobs, setJobs] = React.useState<JobMeta[]>([]);
   const [activeJob, setActiveJob] = React.useState<JobMeta | null>(null);
   const [activeFileName, setActiveFileName] = React.useState<string>("");
+  const [activePreview, setActivePreview] = React.useState<JobPreview | null>(null);
   const [logs, setLogs] = React.useState<LogEntry[]>([]);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [starting, setStarting] = React.useState(false);
+  const startingRef = React.useRef(false);
 
   // Gate on first-run configuration
   const configured = isConfigured(cfg);
@@ -107,6 +112,27 @@ function AppInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Fetch real paragraph previews (original + translated) for the active job
+  // so the progress/result screens render the user's actual document text
+  // instead of placeholders. Re-fetch on status change — the translated
+  // artifact only lands on disk once the job reaches "done", and we want the
+  // preview to upgrade from original-only to side-by-side real text then.
+  React.useEffect(() => {
+    if (!activeJob) {
+      setActivePreview(null);
+      return;
+    }
+    let cancelled = false;
+    getJobPreview(activeJob.id)
+      .then((p) => {
+        if (!cancelled) setActivePreview(p);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [activeJob?.id, activeJob?.status]);
+
   // localStorage sync for language (body lang) when target changes
   React.useEffect(() => {
     const l = LANGUAGES.find((x) => x.code === cfg.target);
@@ -126,16 +152,20 @@ function AppInner() {
   }
 
   async function handleStartJob() {
+    // Guard against double-clicks / rapid re-submits producing duplicate jobs.
+    if (startingRef.current) return;
     const first = stagedFiles[0];
     if (!first) return;
     if (!isConfigured(cfg)) {
       setSettingsOpen(true);
       return;
     }
+    startingRef.current = true;
+    setStarting(true);
     setLogs([]);
     const shape = findShape(cfg.shape);
     try {
-      const { id } = await createJob({
+      const { id, deduped, status } = await createJob({
         file: first.file,
         target_lang: cfg.target,
         provider: cfg.providerId === "custom" ? "openai" : cfg.providerId,
@@ -146,38 +176,57 @@ function AppInner() {
         output_mode: shape.backend,
         max_chunk_tokens: parseInt(cfg.chunkSize, 10) || 2500,
       });
-      // Refresh job list
+      // Refresh job list so sidebar history reflects the (re)used job.
       const list = await listJobs(50).catch(() => []);
       setJobs(list);
-      const meta = (await getJob(id)) || {
-        id,
-        status: "queued" as const,
-        progress: 0,
-        message: "queued",
-        target_lang: cfg.target,
-        provider: cfg.providerId,
-        model: cfg.model,
-        output_mode: shape.backend,
-        input_name: first.name,
-        output_name: "",
-        created_at: Date.now() / 1000,
-        updated_at: Date.now() / 1000,
-        error: null,
-      };
+      const fresh = (await getJob(id).catch(() => null)) ?? null;
+      const meta: JobMeta =
+        fresh ?? {
+          id,
+          status: (status ?? "queued") as JobMeta["status"],
+          progress: 0,
+          message: "queued",
+          target_lang: cfg.target,
+          provider: cfg.providerId,
+          model: cfg.model,
+          output_mode: shape.backend,
+          input_name: first.name,
+          output_name: "",
+          created_at: Date.now() / 1000,
+          updated_at: Date.now() / 1000,
+          error: null,
+        };
       setActiveJob(meta);
-      setActiveFileName(first.name);
-      setRoute({ name: "progress", jobId: id });
-      // Update URL hash so refresh resumes
+      setActiveFileName(meta.input_name || first.name);
       const url = new URL(window.location.href);
       url.hash = `job=${id}`;
       history.replaceState(null, "", url.toString());
-      startPolling(id);
+      // Clear the staged upload — we're done with it either way.
+      setStagedFiles([]);
+
+      if (deduped) {
+        toast({
+          variant: "ok",
+          title: "هذا الملف مُترجَم مسبقًا",
+          description: "تم فتح الترجمة السابقة بدلًا من إعادة التنفيذ.",
+        });
+      }
+
+      if (meta.status === "done" || meta.status === "failed") {
+        setRoute({ name: "result", jobId: id });
+      } else {
+        setRoute({ name: "progress", jobId: id });
+        startPolling(id);
+      }
     } catch (e) {
       toast({
         variant: "error",
         title: "تعذّر إنشاء الطلبية",
         description: String(e instanceof Error ? e.message : e),
       });
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
     }
   }
 
@@ -289,7 +338,7 @@ function AppInner() {
       />
 
       <div className="grid grid-rows-[auto_1fr] min-w-0 overflow-hidden">
-        <div className="h-14 sticky top-0 z-20 border-b border-line bg-[oklch(0.13_0.005_250/0.72)] backdrop-blur-md flex items-center justify-between px-6">
+        <div className="h-14 sticky top-0 z-20 border-b border-line bg-[oklch(0.13_0.005_250/0.72)] backdrop-blur-md flex items-center justify-between px-6 lg:px-12">
           <div className="flex items-center gap-3 text-[13px] text-paper-2">
             <span>س‑ترجم</span>
             <CrumbSep className="h-3.5 w-3.5 text-paper-4" />
@@ -336,6 +385,7 @@ function AppInner() {
               onBack={() => setRoute({ name: "upload" })}
               onStart={handleStartJob}
               isRtl={isRtl}
+              starting={starting}
             />
           )}
           {route.name === "configure" && stagedFiles.length === 0 && (
@@ -351,6 +401,7 @@ function AppInner() {
               job={activeJob}
               fileName={activeFileName}
               logs={logs}
+              preview={activePreview}
               onCancel={handleCancelJob}
               isRtl={isRtl}
             />
@@ -358,6 +409,7 @@ function AppInner() {
           {route.name === "result" && activeJob && (
             <ResultScreen
               job={activeJob}
+              preview={activePreview}
               onAnother={handleNewJob}
               onOpenSettings={() => setSettingsOpen(true)}
             />

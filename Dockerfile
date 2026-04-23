@@ -24,6 +24,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fonts-noto-extra \
       fonts-noto-color-emoji \
       ghostscript \
+      tesseract-ocr \
+      tesseract-ocr-ara \
+      tesseract-ocr-fra \
+      tesseract-ocr-deu \
+      tesseract-ocr-spa \
+      tesseract-ocr-chi-sim \
+      qpdf \
+      unpaper \
+      pngquant \
       curl \
     && rm -rf /var/lib/apt/lists/* \
     && fc-cache -f -v > /dev/null
@@ -40,7 +49,8 @@ RUN pip install --upgrade pip \
         "python-docx>=1.1" "python-pptx>=1.0" "openpyxl>=3.1" \
         "pymupdf>=1.24" "pypdf>=5.0" "docxcompose>=1.4" \
         "fast-langdetect>=0.2" "arabic-reshaper>=3.0" "python-bidi>=0.6" \
-        "lxml>=5.3" "tiktoken>=0.8"
+        "lxml>=5.3" "tiktoken>=0.8" \
+        "ocrmypdf>=16.0"
 
 # App sources
 COPY app ./app

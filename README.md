@@ -47,10 +47,13 @@ docker-compose up --build
 
 ## Fully local (no API keys, no cloud)
 
-The bundled `docker-compose.yml` also starts an [Ollama](https://ollama.com) service. Once up, pull a model once and point the UI at it:
+The bundled `docker-compose.yml` ships an optional [Ollama](https://ollama.com) service behind the `ollama` profile, so `docker compose up` runs only `s-trans` by default. Opt in when you want it:
 
 ```bash
-docker compose up -d
+# Start s-trans + ollama together
+docker compose --profile ollama up -d
+
+# Pull a model once
 docker exec -it $(docker compose ps -q ollama) ollama pull qwen2.5:7b
 ```
 
@@ -60,6 +63,12 @@ Then in the UI at `http://localhost:7860`:
 - **Model:** `ollama/qwen2.5:7b`
 - **API base:** `http://ollama:11434` (the s-trans container talks to the `ollama` service by name)
 - **API key:** any non-empty string (Ollama ignores it; LiteLLM requires the field)
+
+Already running Ollama on the host? Skip the profile and point s-trans at it instead:
+
+```bash
+OLLAMA_API_BASE=http://host.docker.internal:11434 docker compose up -d
+```
 
 Model recommendations by hardware:
 

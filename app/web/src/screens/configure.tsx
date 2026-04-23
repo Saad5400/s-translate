@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, Sparkles, KeyRound, FlipHorizontal2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Sparkles, KeyRound, FlipHorizontal2, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHead, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -26,9 +26,10 @@ interface Props {
   onBack: () => void;
   onStart: () => void;
   isRtl: boolean;
+  starting?: boolean;
 }
 
-export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isRtl }: Props) {
+export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isRtl, starting = false }: Props) {
   const provider = findProvider(cfg.providerId);
   const targetLang = findLang(cfg.target);
   const BackIcon = isRtl ? ArrowRight : ArrowLeft;
@@ -61,7 +62,7 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
 
   return (
     <div className="grid gap-8 animate-in fade-in slide-in-from-bottom-1 duration-300">
-      <header className="flex items-end justify-between gap-4">
+      <header className="flex items-center justify-between gap-4">
         <div className="grid gap-3">
           <div className="text-eyebrow">إعداد الترجمة · الخطوة ٢ من ٣</div>
           <h1 className="text-[28px] font-bold leading-tight tracking-[-0.005em] m-0">
@@ -273,6 +274,9 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
               <Input
                 dir="ltr"
                 type="number"
+                min="200"
+                max="8000"
+                step="100"
                 value={cfg.chunkSize}
                 onChange={(e) => setCfg({ ...cfg, chunkSize: e.target.value })}
               />
@@ -295,12 +299,22 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
           <Button variant="ghost" onClick={onBack}>رجوع</Button>
           <Button
             variant="accent"
-            disabled={!canStart}
+            disabled={!canStart || starting}
             onClick={onStart}
+            aria-busy={starting}
           >
-            <Sparkles className="h-4 w-4" />
-            بدء الترجمة
-            <ForwardIcon className="h-4 w-4" />
+            {starting ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                جاري البدء…
+              </>
+            ) : (
+              <>
+                <Sparkles className="h-4 w-4" />
+                بدء الترجمة
+                <ForwardIcon className="h-4 w-4" />
+              </>
+            )}
           </Button>
         </div>
       </div>

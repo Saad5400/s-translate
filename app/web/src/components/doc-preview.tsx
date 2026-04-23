@@ -1,69 +1,74 @@
-// Generic translated-document illustration used on the progress and result
-// screens. We don't have access to the real document content on the
-// client — this is a representative preview that animates the translation
-// pipeline visually.
+// Live document preview shown on the progress and result screens. When the
+// parent passes `original` / `translated` paragraph arrays (fetched from
+// /api/jobs/{id}/preview), we render real text from the user's uploaded and
+// translated artifacts. Until then we show a scrubbed placeholder so the
+// layout doesn't collapse.
 
 import { cn } from "@/lib/utils";
 
-const SAMPLE = [
-  {
-    en: "In the fourth quarter, the Company delivered record-setting revenue driven by accelerated adoption across its enterprise customer base.",
-    ar: "حققت الشركة في الربع الرابع إيرادات قياسية مدفوعة بتسارع التبنّي لدى قاعدة عملائها من المؤسسات.",
-  },
-  {
-    en: "Gross margin expanded by two hundred and thirty basis points year-over-year, reflecting disciplined cost management.",
-    ar: "اتسع هامش الربح الإجمالي بمقدار مئتين وثلاثين نقطة أساس على أساس سنوي، مما يعكس إدارةً منضبطة للتكاليف.",
-  },
-  {
-    en: "Operating cash flow totaled four hundred and twelve million dollars, the highest in the Company's history.",
-    ar: "بلغ التدفق النقدي التشغيلي أربعمئة واثني عشر مليون دولار، وهو الأعلى في تاريخ الشركة.",
-  },
-  {
-    en: "Regionally, Europe and the Middle East led growth with a thirty-one percent increase.",
-    ar: "قادت أوروبا والشرق الأوسط النمو بزيادة قدرها واحد وثلاثون بالمئة.",
-  },
-  {
-    en: "Looking ahead, management expects full-year guidance to trend toward the upper end of the range.",
-    ar: "تتوقع الإدارة أن تميل التوجيهات السنوية إلى الطرف الأعلى من النطاق المُعلن.",
-  },
+const PLACEHOLDER_LINES = [
+  "………………………………………………………………",
+  "…………………………………………………………………………",
+  "………………………………………………………",
+  "………………………………………………………………",
+  "…………………………………………………………………………",
 ];
 
 export function DocPage({
   mode,
   revealCount = 99,
   showScan = false,
+  title,
+  subtitle,
+  original,
+  translated,
 }: {
   mode: "original" | "translated";
   revealCount?: number;
   showScan?: boolean;
+  title?: string;
+  subtitle?: string;
+  original?: string[];
+  translated?: string[];
 }) {
   if (mode === "original") {
+    const paras = original && original.length ? original : PLACEHOLDER_LINES;
     return (
-      <div className="doc-page" dir="ltr">
-        <h4>Q4 Earnings Brief</h4>
-        <p className="dim">Q4 FY25 · Investor Relations · Confidential</p>
-        {SAMPLE.map((p, i) => (
-          <p key={i}>{p.en}</p>
+      <div className="doc-page" dir="auto">
+        {title && <h4><bdi>{title}</bdi></h4>}
+        {subtitle && <p className="dim">{subtitle}</p>}
+        {paras.map((p, i) => (
+          <p key={i} dir="auto">{p}</p>
         ))}
       </div>
     );
   }
+
+  const origParas = original && original.length ? original : PLACEHOLDER_LINES;
+  const hasTranslated = translated && translated.length > 0;
+  const arParas = hasTranslated ? translated! : origParas;
+  const total = arParas.length;
+  const reveal = hasTranslated ? total : Math.min(total, Math.max(0, revealCount));
+
   return (
     <div className="doc-page rtl" dir="rtl">
-      <h4>ملخص أرباح الربع الرابع</h4>
-      <p className="dim">الربع الرابع من السنة المالية ٢٠٢٥ · علاقات المستثمرين · سرّي</p>
-      {SAMPLE.map((p, i) => (
-        <p key={i} className={i >= revealCount ? "opacity-40" : ""}>
-          {i < revealCount ? (
-            <span className={i === revealCount - 1 ? "chunk-pulse" : ""}>
-              {p.ar}
-            </span>
-          ) : (
-            <span>{p.en.replace(/[a-zA-Z0-9]/g, "•")}</span>
-          )}
-        </p>
-      ))}
-      {showScan && revealCount < SAMPLE.length && <div className="scan" />}
+      {title && <h4><bdi>{title}</bdi></h4>}
+      {subtitle && <p className="dim">{subtitle}</p>}
+      {arParas.map((p, i) => {
+        const revealed = i < reveal;
+        return (
+          <p key={i} className={revealed ? "" : "opacity-40"} dir="auto">
+            {revealed ? (
+              <span className={i === reveal - 1 && !hasTranslated ? "chunk-pulse" : ""}>
+                {p}
+              </span>
+            ) : (
+              <span>{(origParas[i] ?? p).replace(/[^\s·.,;:!?()\[\]"'—-]/g, "•")}</span>
+            )}
+          </p>
+        );
+      })}
+      {showScan && reveal < total && <div className="scan" />}
     </div>
   );
 }

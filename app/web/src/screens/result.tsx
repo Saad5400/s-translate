@@ -1,21 +1,22 @@
 import * as React from "react";
-import { Copy, Check, Download, Plus, Settings, ChevronLeft, ChevronRight, AlertTriangle } from "lucide-react";
+import { Copy, Check, Download, Plus, Settings, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHead, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { SegControl } from "@/components/ui/seg-control";
 import { DocPage } from "@/components/doc-preview";
-import { downloadUrl, type JobMeta } from "@/lib/api";
+import { downloadUrl, type JobMeta, type JobPreview } from "@/lib/api";
 import { findLang, findProvider, findShape } from "@/lib/data";
 import { fmtDur } from "@/lib/utils";
 
 interface Props {
   job: JobMeta;
+  preview: JobPreview | null;
   onAnother: () => void;
   onOpenSettings: () => void;
 }
 
-export function ResultScreen({ job, onAnother, onOpenSettings }: Props) {
+export function ResultScreen({ job, preview, onAnother, onOpenSettings }: Props) {
   const tgt = findLang(job.target_lang);
   const shape =
     job.output_mode === "both_horizontal"
@@ -59,11 +60,11 @@ export function ResultScreen({ job, onAnother, onOpenSettings }: Props) {
               {job.id}
             </span>
           </div>
-          <h1 className="text-[28px] font-bold leading-tight m-0 truncate" dir="ltr">
-            <bdi>{outName}</bdi>
+          <h1 className="text-[28px] font-bold leading-tight m-0 truncate">
+            <bdi dir="auto">{outName}</bdi>
           </h1>
           <div className="text-paper-2 text-sm">
-            تُرجم إلى {tgt.name} · {shape.label} · المدة{" "}
+            {isFailed ? "الهدف" : "تُرجم إلى"} {tgt.name} · {shape.label} · المدة{" "}
             {fmtDur(Math.max(1, (job.updated_at - job.created_at) || 1))}
           </div>
         </div>
@@ -98,59 +99,104 @@ export function ResultScreen({ job, onAnother, onOpenSettings }: Props) {
       )}
 
       <div className="grid lg:grid-cols-[1fr_320px] gap-5">
-        <div className="rounded-lg border border-line bg-ink-1 p-5 grid gap-4 min-w-0">
-          <div className="flex items-center justify-between gap-3">
-            <div className="text-micro">المعاينة</div>
-            <SegControl
-              value={view}
-              onChange={setView}
-              options={[
-                { value: "translated", label: "المُترجَم" },
-                { value: "original", label: "الأصل" },
-                { value: "side-by-side", label: "جنبًا إلى جنب" },
-              ]}
-            />
-          </div>
-          <div className="rounded-md border border-line bg-ink-0 bg-grid-paper p-6 min-h-[60vh] grid place-items-center">
-            {view === "translated" && (
-              <div className="w-[min(520px,100%)]">
-                <DocPage mode="translated" />
-              </div>
-            )}
-            {view === "original" && (
-              <div className="w-[min(520px,100%)]">
-                <DocPage mode="original" />
-              </div>
-            )}
-            {view === "side-by-side" && (
-              <div className="w-[min(900px,100%)] grid grid-cols-2 gap-3.5">
-                <DocPage mode="original" />
-                <DocPage mode="translated" />
-              </div>
-            )}
-          </div>
-          <div className="flex items-center justify-between flex-wrap gap-3">
-            <div className="flex items-center gap-2 text-paper-3 text-[12px]">
-              <span className="font-mono">Page 1</span>
-              <span>·</span>
-              <span>الخطوط والأنماط محفوظة</span>
-              {tgt.rtl && (
-                <>
-                  <span>·</span>
-                  <span className="text-accent">تم عكس التخطيط</span>
-                </>
-              )}
+        {isDone ? (
+          <div className="rounded-lg border border-line bg-ink-1 p-5 grid gap-4 min-w-0">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-micro">المعاينة</div>
+              <SegControl
+                value={view}
+                onChange={setView}
+                options={[
+                  { value: "translated", label: "المُترجَم" },
+                  { value: "original", label: "الأصل" },
+                  { value: "side-by-side", label: "جنبًا إلى جنب" },
+                ]}
+              />
             </div>
-            <div className="flex items-center gap-1.5">
-              <Button variant="ghost" size="iconSm" aria-label="السابق">
-                <ChevronRight className="h-3.5 w-3.5" />
-              </Button>
-              <Button variant="ghost" size="iconSm" aria-label="التالي">
-                <ChevronLeft className="h-3.5 w-3.5" />
+            <div className="rounded-md border border-line bg-ink-0 bg-grid-paper p-6 min-h-[60vh] grid place-items-center">
+              {(() => {
+                const origParas = preview?.original ?? [];
+                const transParas = preview?.translated ?? [];
+                const titleBase = (job.input_name || outName).replace(/\.[^.]+$/, "");
+                const arTitle = `النسخة المُترجمة — ${titleBase}`;
+                const arSubtitle = `الهدف: ${tgt.name}`;
+                return (
+                  <>
+                    {view === "translated" && (
+                      <div className="w-[min(520px,100%)]">
+                        <DocPage
+                          mode="translated"
+                          title={arTitle}
+                          subtitle={arSubtitle}
+                          original={origParas}
+                          translated={transParas}
+                        />
+                      </div>
+                    )}
+                    {view === "original" && (
+                      <div className="w-[min(520px,100%)]">
+                        <DocPage
+                          mode="original"
+                          title={titleBase}
+                          subtitle={job.input_name}
+                          original={origParas}
+                        />
+                      </div>
+                    )}
+                    {view === "side-by-side" && (
+                      <div className="w-[min(900px,100%)] grid grid-cols-2 gap-3.5">
+                        <DocPage
+                          mode="original"
+                          title={titleBase}
+                          subtitle={job.input_name}
+                          original={origParas}
+                        />
+                        <DocPage
+                          mode="translated"
+                          title={arTitle}
+                          subtitle={arSubtitle}
+                          original={origParas}
+                          translated={transParas}
+                        />
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+            <div className="flex items-center justify-between flex-wrap gap-3 text-paper-3 text-[12px]">
+              <div className="flex items-center gap-2">
+                <span>الخطوط والأنماط محفوظة</span>
+                {tgt.rtl && (
+                  <>
+                    <span>·</span>
+                    <span className="text-accent">تم عكس التخطيط</span>
+                  </>
+                )}
+              </div>
+              <span className="text-micro">معاينة تمثيلية</span>
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-line bg-ink-1 p-5 grid place-items-center min-h-[60vh] min-w-0">
+            <div className="grid place-items-center gap-3 text-center max-w-sm">
+              <div className="w-12 h-12 grid place-items-center rounded-full border border-[oklch(0.72_0.17_28/0.35)] bg-[oklch(0.72_0.17_28/0.08)]">
+                <AlertTriangle className="h-5 w-5 text-danger" />
+              </div>
+              <div className="text-[16px] font-semibold text-paper-0">
+                لم تكتمل الترجمة
+              </div>
+              <div className="text-[13px] text-paper-2 leading-relaxed">
+                لا توجد معاينة لأن الطلبية لم تنجح. راجع رسالة الخطأ أعلاه ثم
+                أعد المحاولة بطلبية جديدة.
+              </div>
+              <Button variant="accent" className="mt-2" onClick={onAnother}>
+                <Plus className="h-4 w-4" />
+                ابدأ ترجمة جديدة
               </Button>
             </div>
           </div>
-        </div>
+        )}
 
         <div className="grid gap-4 min-w-0">
           <Card>

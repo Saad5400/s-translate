@@ -48,6 +48,11 @@ class JobMeta:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error: str | None = None
+    # sha256 of the uploaded input bytes — used to dedup (same file + target_lang).
+    content_hash: str = ""
+    # Filename of the cached pre-combine ("raw") translated artifact, relative to
+    # the job's output/ dir. Enables combine-on-request for alternate output modes.
+    raw_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,6 +93,7 @@ def update_status(
     message: str | None = None,
     error: str | None = None,
     output_name: str | None = None,
+    raw_name: str | None = None,
 ) -> JobMeta | None:
     meta = load_meta(job_id)
     if meta is None:
@@ -102,8 +108,46 @@ def update_status(
         meta.error = error
     if output_name is not None:
         meta.output_name = output_name
+    if raw_name is not None:
+        meta.raw_name = raw_name
     save_meta(meta)
     return meta
+
+
+def find_existing_job(
+    content_hash: str,
+    target_lang: str,
+    max_age_seconds: int,
+    *,
+    statuses: tuple[JobStatus, ...] = ("queued", "running", "done"),
+) -> JobMeta | None:
+    """Return the freshest job matching (content_hash, target_lang) within TTL.
+
+    Skips failed jobs so a retry is not blocked by a prior error. Ignores
+    output_mode — callers that need a specific mode should combine on request
+    from the cached raw translated file.
+    """
+    if not content_hash or not target_lang:
+        return None
+    cutoff = time.time() - max_age_seconds
+    best: JobMeta | None = None
+    for d in _jobs_root().iterdir():
+        if not d.is_dir():
+            continue
+        meta = load_meta(d.name)
+        if not meta:
+            continue
+        if meta.content_hash != content_hash:
+            continue
+        if meta.target_lang != target_lang:
+            continue
+        if meta.status not in statuses:
+            continue
+        if meta.created_at < cutoff:
+            continue
+        if best is None or meta.created_at > best.created_at:
+            best = meta
+    return best
 
 
 def list_jobs(limit: int = 50) -> list[JobMeta]:

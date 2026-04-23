@@ -5,7 +5,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { DocPage } from "@/components/doc-preview";
-import type { JobMeta } from "@/lib/api";
+import type { JobMeta, JobPreview } from "@/lib/api";
 import { findLang, STEPS } from "@/lib/data";
 import { fmtDur } from "@/lib/utils";
 
@@ -19,6 +19,7 @@ interface Props {
   job: JobMeta;
   fileName: string;
   logs: LogEntry[];
+  preview: JobPreview | null;
   onCancel: () => void;
   isRtl: boolean;
 }
@@ -30,9 +31,15 @@ const LEVEL_TEXT: Record<LogEntry["level"], string> = {
   err: "ERR ",
 };
 
-export function ProgressScreen({ job, fileName, logs, onCancel, isRtl }: Props) {
+export function ProgressScreen({ job, fileName, logs, preview, onCancel, isRtl }: Props) {
   const [paused, setPaused] = React.useState(false);
   const pct = Math.round(job.progress * 100);
+  const origParas = preview?.original ?? [];
+  const transParas = preview?.translated ?? [];
+  const titleBase = fileName.replace(/\.[^.]+$/, "");
+  const subtitle = fileName;
+  const arTitle = `النسخة المُترجمة — ${titleBase}`;
+  const arSubtitle = `الهدف: ${findLang(job.target_lang).name}`;
 
   const msg = job.message || "…";
   // Heuristic: map message to step index
@@ -49,7 +56,11 @@ export function ProgressScreen({ job, fileName, logs, onCancel, isRtl }: Props) 
     return 0;
   }, [msg, job.progress]);
 
-  const revealCount = Math.min(5, Math.max(0, Math.floor(job.progress * 6)));
+  const previewCount = Math.max(origParas.length, transParas.length, 5);
+  const revealCount = Math.min(
+    previewCount,
+    Math.max(0, Math.floor(job.progress * (previewCount + 1)))
+  );
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
@@ -70,10 +81,10 @@ export function ProgressScreen({ job, fileName, logs, onCancel, isRtl }: Props) 
               {job.id}
             </span>
           </div>
-          <h1 className="text-[28px] font-bold leading-tight m-0">
-            <bdi>{fileName}</bdi>{" "}
-            <ForwardIcon className="inline h-5 w-5 text-paper-3" />{" "}
-            {findLang(job.target_lang).name}
+          <h1 className="text-[28px] font-bold leading-tight m-0 flex flex-wrap items-center gap-2.5">
+            <bdi>{fileName}</bdi>
+            <ForwardIcon className="h-5 w-5 text-paper-3 shrink-0" />
+            <span>{findLang(job.target_lang).name}</span>
           </h1>
           <div className="text-paper-2 text-sm truncate">{msg}</div>
         </div>
@@ -89,7 +100,7 @@ export function ProgressScreen({ job, fileName, logs, onCancel, isRtl }: Props) 
         </div>
       </header>
 
-      <Card className="!p-5">
+      <Card>
         <div className="flex items-center justify-between mb-2.5">
           <span className="font-mono text-[13px] text-paper-1">{pct}%</span>
           <span className="text-micro">
@@ -115,14 +126,27 @@ export function ProgressScreen({ job, fileName, logs, onCancel, isRtl }: Props) 
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <Badge>Before</Badge>
-              <ArrowRight className="h-4 w-4 text-paper-4" />
-              <Badge variant="running">After · RTL</Badge>
+              <Badge>الأصل</Badge>
+              <ForwardIcon className="h-4 w-4 text-paper-4" />
+              <Badge variant="running">المُترجَم · RTL</Badge>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-4 min-h-0">
-            <DocPage mode="original" />
-            <DocPage mode="translated" revealCount={revealCount} showScan />
+            <DocPage
+              mode="original"
+              title={titleBase}
+              subtitle={subtitle}
+              original={origParas}
+            />
+            <DocPage
+              mode="translated"
+              title={arTitle}
+              subtitle={arSubtitle}
+              original={origParas}
+              translated={transParas}
+              revealCount={revealCount}
+              showScan
+            />
           </div>
           <div className="text-micro text-center">
             يتم الحفاظ على الخطوط · الصور · التنسيق — يُعكس الاتجاه للّغات RTL
@@ -209,7 +233,7 @@ export function ProgressScreen({ job, fileName, logs, onCancel, isRtl }: Props) 
         </div>
       </div>
 
-      <Card className="!p-3.5 flex gap-3 items-center">
+      <Card className="p-3.5 flex gap-3 items-center">
         <Clock className="h-4 w-4 text-paper-3" />
         <span className="text-paper-2 text-[13px]">
           يمكنك إغلاق النافذة. ستُتاح النتيجة عبر المُعرِّف{" "}

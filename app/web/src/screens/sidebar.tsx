@@ -57,7 +57,7 @@ export function Sidebar({ jobs, currentJobId, onNewJob, onPickJob }: Props) {
                 key={j.id}
                 type="button"
                 onClick={() => onPickJob(j)}
-                aria-current={currentJobId === j.id}
+                aria-current={currentJobId === j.id ? "page" : undefined}
                 className={cn(
                   "text-start w-full grid gap-1 p-2.5 rounded-md border border-transparent cursor-pointer",
                   "hover:bg-white/5",

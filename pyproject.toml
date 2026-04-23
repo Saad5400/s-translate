@@ -22,6 +22,7 @@ dependencies = [
   "python-bidi>=0.6",
   "lxml>=5.3",
   "tiktoken>=0.8",
+  "ocrmypdf>=16.0",
 ]
 
 [project.optional-dependencies]

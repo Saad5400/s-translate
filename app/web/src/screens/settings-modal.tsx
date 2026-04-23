@@ -70,7 +70,7 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
           {!enforceGate && (
             <Button
               variant="ghost"
-              size="icon"
+              size="iconSm"
               onClick={() => onOpenChange(false)}
               aria-label="إغلاق"
             >

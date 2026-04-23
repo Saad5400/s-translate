@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from typing import Callable, Iterable
+from urllib.parse import urlparse
 
 from tenacity import (
     retry,
@@ -17,9 +18,41 @@ from ..config import settings
 from ..schemas import Segment
 from ..utils.errors import LLMError
 from .chunker import chunk_segments, mask_placeholders, unmask_placeholders
-from .prompts import SYSTEM_PROMPT, build_user_message
+from .prompts import (
+    CONTEXT_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_context_user_message,
+    build_user_message,
+)
 
 log = logging.getLogger(__name__)
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def resolve_ollama_base(api_base: str | None) -> str | None:
+    """Return an Ollama api_base that is reachable from this process.
+
+    Inside Docker, the UI default of ``http://localhost:11434`` points at the
+    container itself and the connection refuses. When ``OLLAMA_API_BASE`` is
+    set (e.g. ``http://host.docker.internal:11434`` or ``http://ollama:11434``
+    via docker-compose), we rewrite any loopback-pointing base to that value.
+    Missing/empty api_base also picks up the env default so the user can leave
+    the field blank in Docker deployments.
+    """
+    override = os.getenv("OLLAMA_API_BASE", "").strip() or None
+    if not api_base:
+        return override
+    if not override:
+        return api_base
+    try:
+        host = urlparse(api_base).hostname
+    except ValueError:
+        return api_base
+    if host and host.lower() in _LOOPBACK_HOSTS:
+        return override
+    return api_base
 
 # Allow test injection of a stub translator for offline tests.
 _STUB_FN: Callable[[list[Segment], str, str | None], list[str]] | None = None
@@ -41,9 +74,64 @@ class LLMClient:
     ) -> None:
         self.model = model
         self.api_key = api_key
+        if model.startswith("ollama/") or model.startswith("ollama_chat/"):
+            api_base = resolve_ollama_base(api_base)
         self.api_base = api_base
         self.temperature = temperature
         self.semaphore = asyncio.Semaphore(concurrency)
+
+    async def summarize_document(
+        self,
+        segments: list[Segment],
+        target_lang: str,
+        source_lang: str | None = None,
+        max_chars: int = 6000,
+    ) -> str:
+        """Build a short domain-context brief from the document's own text.
+
+        The brief is fed into every translate_segments call so the LLM can pick
+        the correct domain-specific terminology instead of literal word-for-word
+        translations. Samples up to ``max_chars`` from the start/middle/end of
+        the extracted segments so very long documents still fit in one request.
+        Returns an empty string on any failure — context is an enhancement, not
+        a blocker: translation proceeds normally when it's missing.
+        """
+        if _STUB_FN is not None:
+            return ""
+        if not segments:
+            return ""
+        excerpt = _sample_segments_excerpt(segments, max_chars=max_chars)
+        if not excerpt.strip():
+            return ""
+        try:
+            import litellm
+
+            messages = [
+                {"role": "system", "content": CONTEXT_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": build_context_user_message(excerpt, source_lang, target_lang),
+                },
+            ]
+            kwargs: dict = dict(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                api_key=self.api_key,
+            )
+            if self.api_base:
+                kwargs["api_base"] = self.api_base
+            resp = await litellm.acompletion(**kwargs)
+            content = (resp.choices[0].message.content or "").strip()
+            # Guard: an over-verbose or empty response still returns safely — the
+            # translator prompt just ignores an empty brief.
+            if len(content) > 2000:
+                content = content[:2000].rstrip() + "…"
+            log.info("document context brief: %s", content.replace("\n", " "))
+            return content
+        except Exception as exc:
+            log.warning("context brief generation failed (%s); proceeding without", exc)
+            return ""
 
     async def translate_segments(
         self,
@@ -52,6 +140,7 @@ class LLMClient:
         source_lang: str | None = None,
         max_chunk_tokens: int = settings.default_chunk_tokens,
         progress: Callable[[float, str], None] | None = None,
+        context: str | None = None,
     ) -> list[Segment]:
         """Translate segments in-place (sets .translated). Returns same list."""
         # Filter out empty segments (no translation needed).
@@ -94,7 +183,9 @@ class LLMClient:
                             f"Translating chunk {done + in_flight}/{total}",
                         )
                     try:
-                        await self._translate_chunk(chunk, target_lang, source_lang)
+                        await self._translate_chunk(
+                            chunk, target_lang, source_lang, context=context,
+                        )
                     finally:
                         in_flight -= 1
                 done += 1
@@ -122,6 +213,7 @@ class LLMClient:
         chunk: list[Segment],
         target_lang: str,
         source_lang: str | None,
+        context: str | None = None,
     ) -> None:
         import litellm
 
@@ -129,7 +221,12 @@ class LLMClient:
         payload_json = json.dumps(payload, ensure_ascii=False)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_message(payload_json, target_lang, source_lang)},
+            {
+                "role": "user",
+                "content": build_user_message(
+                    payload_json, target_lang, source_lang, context=context,
+                ),
+            },
         ]
         kwargs: dict = dict(
             model=self.model,
@@ -168,6 +265,45 @@ class LLMClient:
             else:
                 log.warning("segment %s missing in response; keeping original", seg.id)
                 seg.translated = seg.meta.get("_original_text", seg.text)
+
+
+def _sample_segments_excerpt(segments: list[Segment], max_chars: int = 6000) -> str:
+    """Return a representative text sample from ``segments`` no longer than
+    ``max_chars`` chars. For long documents, blends text from the START, MIDDLE,
+    and END so a context summariser sees terminology from each section rather
+    than only the first few pages (title/TOC/preface). Short documents fall
+    through and return all text verbatim.
+    """
+    texts = [s.text for s in segments if s.text and s.text.strip()]
+    if not texts:
+        return ""
+    all_text = "\n".join(texts)
+    if len(all_text) <= max_chars:
+        return all_text
+
+    n = len(texts)
+    per_section = max_chars // 3
+
+    def _take_from(start_idx: int, step: int) -> str:
+        picked: list[str] = []
+        total = 0
+        i = start_idx
+        while 0 <= i < n and total < per_section:
+            t = texts[i]
+            remaining = per_section - total
+            snippet = t if len(t) <= remaining else t[:remaining]
+            picked.append(snippet)
+            total += len(snippet)
+            i += step
+        return "\n".join(picked)
+
+    start_part = _take_from(0, 1)
+    mid_part = _take_from(n // 2, 1)
+    end_part = _take_from(n - 1, -1)
+    joined = "\n\n---\n\n".join(
+        p for p in (start_part, mid_part, end_part) if p.strip()
+    )
+    return joined[:max_chars]
 
 
 def _parse_json(content: str) -> dict | None:

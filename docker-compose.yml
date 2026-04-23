@@ -1,6 +1,7 @@
 services:
   ollama:
     image: ollama/ollama:latest
+    profiles: ["ollama"]
     ports:
       - "11434:11434"
     volumes:
@@ -26,10 +27,17 @@ services:
       LOG_LEVEL: INFO
       MAX_UPLOAD_MB: "50"
       CONCURRENT_CHUNKS: "1"
+      # Rewrites any loopback ollama api_base (the UI default) to an address
+      # reachable from this container. Point at the compose `ollama` service
+      # by default; override to host.docker.internal to use host-run Ollama.
+      OLLAMA_API_BASE: ${OLLAMA_API_BASE:-http://ollama:11434}
+    extra_hosts:
+      # Let Linux containers reach the host via host.docker.internal so users
+      # can set OLLAMA_API_BASE=http://host.docker.internal:11434 when they
+      # run Ollama natively on the host.
+      - "host.docker.internal:host-gateway"
     volumes:
       - s-trans-tmp:/tmp/s-trans
-    depends_on:
-      - ollama
     restart: unless-stopped
 
 volumes:

@@ -147,7 +147,19 @@ export function UploadScreen({
           </div>
         </div>
       ) : (
-        <Card>
+        <Card
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            handleFiles(e.dataTransfer.files);
+          }}
+          className={cn(
+            "transition-colors",
+            dragOver && "border-accent ring-2 ring-accent-soft"
+          )}
+        >
           <CardHead>
             <CardTitle>في طابور الترجمة · {stagedFiles.length}</CardTitle>
             <Button variant="ghost" size="sm" onClick={() => inputRef.current?.click()}>
@@ -204,7 +216,14 @@ export function UploadScreen({
           <p className="text-paper-2 text-[13px] m-0">
             لديك مُعرِّف ترجمة من تبويب سابق؟ ألصقه هنا لاستعادة النتيجة.
           </p>
-          <div className="flex gap-2 mt-3">
+          <form
+            className="flex gap-2 mt-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const id = idInput.trim();
+              if (id) onResumeById(id);
+            }}
+          >
             <Input
               placeholder="tr_01HZ…"
               value={idInput}
@@ -213,13 +232,10 @@ export function UploadScreen({
               className="font-mono"
               aria-label="مُعرِّف الطلبية"
             />
-            <Button
-              disabled={!idInput.trim()}
-              onClick={() => onResumeById(idInput.trim())}
-            >
+            <Button type="submit" disabled={!idInput.trim()}>
               فتح
             </Button>
-          </div>
+          </form>
         </Card>
 
         <Card>

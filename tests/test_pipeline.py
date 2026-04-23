@@ -157,6 +157,45 @@ async def test_pdf_translate():
 
 
 @pytest.mark.asyncio
+async def test_pdf_translate_1to1_preserves_layout():
+    """For a native-text PDF (common case) the translated output must:
+      * keep the same page count
+      * keep the same page dimensions
+      * NOT get rasterised to a full-page image (would ruin 1:1 match)
+      * keep the translated text extractable as NATIVE PDF text
+    Regression guard for the OCR-skip path added to preserve 1:1 fidelity on
+    native PDFs.
+    """
+    import pymupdf
+
+    job = _job(FIXTURES / "sample.pdf")
+    out = await run_job(job)
+    orig = pymupdf.open(str(FIXTURES / "sample.pdf"))
+    tr = pymupdf.open(str(out))
+    try:
+        assert tr.page_count == orig.page_count
+        for i in range(orig.page_count):
+            op, tp = orig[i], tr[i]
+            assert abs(op.rect.width - tp.rect.width) < 1
+            assert abs(op.rect.height - tp.rect.height) < 1
+            # No full-page raster image — would mean the page got rasterised.
+            page_area = tp.rect.width * tp.rect.height
+            for info in tp.get_image_info(xrefs=False):
+                b = info.get("bbox")
+                if not b:
+                    continue
+                img_area = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+                assert img_area < 0.8 * page_area, (
+                    f"page {i} got a full-page image — OCR leaked through"
+                )
+        all_text = "\n".join(tr[i].get_text("text") for i in range(tr.page_count))
+        assert "es]" in all_text
+    finally:
+        orig.close()
+        tr.close()
+
+
+@pytest.mark.asyncio
 async def test_vertical_combine_docx():
     from docx import Document
 

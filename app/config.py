@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     libreoffice_bin: str = "soffice"
     fonts_dir: Path = Path(__file__).parent / "fonts"
     job_ttl_seconds: int = 7 * 24 * 3600  # 7 days
+    pdf_ocr_languages: str = "eng+ara"
+    # 0 means "let ocrmypdf pick (os.cpu_count())"; explicit integer caps it.
+    pdf_ocr_jobs: int = 0
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 

@@ -48,6 +48,12 @@ async def run_job(
     translator = get_translator(src)
 
     with job_workspace() as wd:
+        if fmt is DocFormat.PDF:
+            from .translators.pdf_ocr import maybe_ocr_pdf
+
+            _p(0.01, "Running OCR")
+            src = maybe_ocr_pdf(src, wd)
+
         # 1. Detect source language (optional, purely for prompting context).
         _p(0.02, "Detecting source language")
         source_lang = job.source_lang
@@ -71,8 +77,23 @@ async def run_job(
             temperature=job.temperature,
         )
 
+        # 3a. Build a document-wide context brief BEFORE translating, so every
+        # chunk is translated with the same domain vocabulary. Without this,
+        # domain-specific terms like "sprint" (Scrum) or "pipeline" (DevOps)
+        # risk being translated literally and out of context. One summary call
+        # per job; cost stays negligible even on very long docs because we
+        # sample text from start/middle/end rather than sending everything.
+        _p(0.10, "Reading document for context")
+        context = await client.summarize_document(
+            segments,
+            target_lang=job.target_lang,
+            source_lang=source_lang,
+        )
+        if context:
+            log.info("using document context (%d chars)", len(context))
+
         def _llm_progress(f: float, msg: str) -> None:
-            _p(0.08 + f * 0.7, msg)
+            _p(0.12 + f * 0.66, msg)
 
         await client.translate_segments(
             segments,
@@ -80,6 +101,7 @@ async def run_job(
             source_lang=source_lang,
             max_chunk_tokens=job.max_chunk_tokens,
             progress=_llm_progress,
+            context=context,
         )
 
         # 4. Reinsert into format-preserving output.
@@ -95,6 +117,15 @@ async def run_job(
         if is_rtl(job.target_lang):
             _p(0.88, "Applying RTL direction")
             apply_rtl(translated_path, fmt)
+
+        # Cache the pre-combine ("raw") artifact so future requests for a
+        # different output_mode can combine it without re-running the LLM.
+        if job_id:
+            raw_name = f"__raw{src.suffix}"
+            raw_stable = jobs_mod.output_path(job_id, raw_name)
+            raw_stable.unlink(missing_ok=True)
+            _link_or_copy(translated_path, raw_stable)
+            jobs_mod.update_status(job_id, raw_name=raw_name)
 
         # 6. Combine if needed.
         mode = job.output_mode
@@ -130,11 +161,22 @@ async def run_job(
             stable_out = settings.temp_dir / "out"
             stable_out.mkdir(parents=True, exist_ok=True)
             stable_path = stable_out / filename
-        if stable_path.exists():
-            stable_path.unlink()
-        shutil.copy2(final, stable_path)
+        stable_path.unlink(missing_ok=True)
+        _link_or_copy(final, stable_path)
         _p(1.0, "Done")
         return stable_path
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Hardlink when `src` and `dst` share a filesystem (zero-copy), else
+    fall back to copy2. Saves real time on large translated PDFs since both
+    the workspace and job dir live under settings.temp_dir."""
+    try:
+        import os
+
+        os.link(src, dst)
+    except (OSError, NotImplementedError):
+        shutil.copy2(src, dst)
 
 
 def _import_pdf_cls():
@@ -144,38 +186,70 @@ def _import_pdf_cls():
 
 def _sample_text(src: Path, fmt: DocFormat) -> str:
     """Grab a short text sample for language detection."""
+    return " ".join(sample_paragraphs(src, fmt, max_paragraphs=30))[:2000]
+
+
+def sample_paragraphs(
+    src: Path, fmt: DocFormat, *, max_paragraphs: int = 6, max_chars: int = 260
+) -> list[str]:
+    """Return the first N non-empty paragraph-like strings from a document.
+
+    Used by the UI's preview endpoint so the progress/result screens can show
+    real text from the uploaded and translated artifacts instead of placeholder
+    filler. Each entry is trimmed to `max_chars` so the preview stays compact.
+    """
+    def _finish(items: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in items:
+            s = " ".join((raw or "").split())
+            if not s:
+                continue
+            if len(s) > max_chars:
+                s = s[: max_chars - 1].rstrip() + "…"
+            out.append(s)
+            if len(out) >= max_paragraphs:
+                break
+        return out
+
     try:
         if fmt is DocFormat.TXT:
-            return src.read_text(encoding="utf-8", errors="replace")[:2000]
+            text = src.read_text(encoding="utf-8", errors="replace")
+            return _finish([p for p in text.split("\n\n") if p.strip()])
         if fmt is DocFormat.DOCX:
             from docx import Document
 
             d = Document(str(src))
-            return " ".join(p.text for p in d.paragraphs[:30])[:2000]
+            return _finish([p.text for p in d.paragraphs if p.text and p.text.strip()])
         if fmt is DocFormat.PPTX:
             from pptx import Presentation
 
             prs = Presentation(str(src))
             parts: list[str] = []
-            for slide in prs.slides[:3]:
+            for slide in prs.slides:
                 for shape in slide.shapes:
-                    if shape.has_text_frame:
+                    if shape.has_text_frame and shape.text_frame.text.strip():
                         parts.append(shape.text_frame.text)
-            return " ".join(parts)[:2000]
+                if len(parts) >= max_paragraphs * 2:
+                    break
+            return _finish(parts)
         if fmt is DocFormat.XLSX:
             from openpyxl import load_workbook
 
             wb = load_workbook(str(src), read_only=True)
             parts: list[str] = []
-            ws = wb.worksheets[0] if wb.worksheets else None
-            if ws is None:
-                return ""
-            for row in ws.iter_rows(max_row=50, values_only=True):
-                for v in row:
-                    if isinstance(v, str):
-                        parts.append(v)
-            wb.close()
-            return " ".join(parts)[:2000]
+            try:
+                ws = wb.worksheets[0] if wb.worksheets else None
+                if ws is None:
+                    return []
+                for row in ws.iter_rows(max_row=200, values_only=True):
+                    row_vals = [str(v) for v in row if isinstance(v, str) and v.strip()]
+                    if row_vals:
+                        parts.append(" · ".join(row_vals))
+                    if len(parts) >= max_paragraphs * 2:
+                        break
+            finally:
+                wb.close()
+            return _finish(parts)
         if fmt is DocFormat.PDF:
             import pymupdf
 
@@ -183,15 +257,18 @@ def _sample_text(src: Path, fmt: DocFormat) -> str:
             try:
                 parts: list[str] = []
                 for page in d:
-                    parts.append(page.get_text("text"))
-                    if sum(len(p) for p in parts) > 2000:
+                    for block in page.get_text("blocks"):
+                        txt = block[4] if len(block) > 4 else ""
+                        if isinstance(txt, str) and txt.strip():
+                            parts.append(txt)
+                    if len(parts) >= max_paragraphs * 2:
                         break
-                return " ".join(parts)[:2000]
+                return _finish(parts)
             finally:
                 d.close()
     except Exception:
-        return ""
-    return ""
+        return []
+    return []
 
 
 def _mode_suffix(mode: OutputMode) -> str:

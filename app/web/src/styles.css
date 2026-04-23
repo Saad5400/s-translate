@@ -4,7 +4,7 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --font-ar: "Tajawal", ui-sans-serif, system-ui, sans-serif;
+  --font-ar: "IBM Plex Sans Arabic", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-serif: "Newsreader", Georgia, "Times New Roman", serif;
 
