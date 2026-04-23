@@ -257,11 +257,23 @@ class LLMClient:
         if parsed is None:
             raise LLMError(f"Could not parse JSON response: {content[:200]}")
 
-        # Match back by id. Missing keys -> fall back to original text.
+        # Match back by id.
+        #   Missing key          -> fall back to original text (LLM lost it).
+        #   Empty string ("")    -> LLM flagged as OCR noise; mark dropped
+        #                           so the renderer can skip it (prompt rule 12).
+        #   Non-empty string     -> normal translated value.
         for seg in chunk:
-            translated = parsed.get(seg.id)
-            if isinstance(translated, str) and translated:
-                seg.translated = _normalize_target_text(translated, target_lang)
+            if seg.id in parsed:
+                translated = parsed[seg.id]
+                if isinstance(translated, str):
+                    if translated == "":
+                        seg.translated = ""
+                        seg.meta["_ocr_noise"] = True
+                    else:
+                        seg.translated = _normalize_target_text(translated, target_lang)
+                else:
+                    log.warning("segment %s has non-string translation; keeping original", seg.id)
+                    seg.translated = seg.meta.get("_original_text", seg.text)
             else:
                 log.warning("segment %s missing in response; keeping original", seg.id)
                 seg.translated = seg.meta.get("_original_text", seg.text)

@@ -160,6 +160,14 @@ class PdfTranslator(Translator):
 
         doc = pymupdf.open(str(src_path))
         try:
+            # Segments the LLM flagged as OCR noise (empty translation,
+            # prompt rule 12) must be dropped here — their bboxes are
+            # covering pictogram/icon pixels and must NOT be filled
+            # (filling would erase the icon and leave a blank rect).
+            segments = [
+                s for s in segments
+                if not s.meta.get("_ocr_noise")
+            ]
             by_page: dict[int, list[Segment]] = {}
             for seg in segments:
                 by_page.setdefault(seg.meta["page"], []).append(seg)
@@ -365,6 +373,12 @@ def _drop_ocr_noise(segments: list[Segment]) -> list[Segment]:
         # length <= 6 — tesseract garbage on photo pixels.
         if len(stripped) <= 6 and alnum / len(stripped) < 0.5:
             continue
+        # Short fragments containing bracket-like glyphs ( [] {} () <> |
+        # \/ ) are almost always tesseract misreading pictogram/icon
+        # pixels (e.g. a checkbox icon read as "B[]", a chevron as
+        # "R]"). Real short text-captions don't use these characters.
+        if len(stripped) <= 5 and any(c in "[]{}()<>|\\/" for c in stripped):
+            continue
         # Tiny mostly-non-ASCII fragments are almost always tesseract
         # hallucinating glyphs in photo pixels (e.g. ``للري`` / ``كرا``
         # appearing inside a stock photo of monitors). Drop them so they
@@ -539,9 +553,23 @@ def _should_merge_vertical(prev: Segment, curr: Segment) -> bool:
     if abs(pb[0] - cb[0]) > x_tol:
         return False
     y_gap = cb[1] - pb[3]
-    # Allow minor overlap for ascenders/descenders (-0.5 * size) and cap at
-    # ~1.6 line heights so a full paragraph break (blank line) is preserved.
-    if y_gap < -0.5 * avg_size or y_gap > 1.6 * avg_size:
+    # Allow minor overlap for ascenders/descenders (-0.5 * size). The upper
+    # cap separates three cases:
+    #   * y_gap ≤ ~0.4 * size — standard line-spacing inside a paragraph;
+    #     this is the ONLY case we want to merge. OCR routinely splits a
+    #     single paragraph into per-line segments that sit this tight.
+    #   * y_gap ≈ 0.6-1.1 * size — bulleted list items with one blank-line
+    #     worth of separation. Merging these destroys the bullet list,
+    #     producing a run-on paragraph with no structure. Must reject.
+    #   * y_gap ≥ ~1.3 * size — paragraph break, clearly rejected.
+    # A cutoff of 0.55 preserves paragraph continuation while keeping
+    # bulleted items separate. We also reject when prev ends in a
+    # sentence-terminator ('.', '!', '?', '؟', '۔') followed by a gap
+    # ≥ 0.4 * size — that's a paragraph break even without a blank line.
+    if y_gap < -0.5 * avg_size or y_gap > 0.55 * avg_size:
+        return False
+    prev_text = (prev.text or "").rstrip()
+    if prev_text and prev_text[-1] in ".!?؟。۔" and y_gap > 0.4 * avg_size:
         return False
     # A paragraph's LAST line is routinely much narrower than the
     # preceding full-width lines — "users." trailing "reached
@@ -1010,26 +1038,35 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
     else:
         page_bg = np.array([255, 255, 255], dtype=np.uint8)
 
+    box_fills: list[np.ndarray] = []
     for _, (ix0, iy0, ix1, iy1) in scaled_boxes:
         local = _sample_local_bg(arr, text_mask, (ix0, iy0, ix1, iy1), ring=16)
         fill = local if local is not None else page_bg
         arr[iy0:iy1, ix0:ix1] = fill
+        box_fills.append(fill)
 
-    # BEFORE flipping, capture any BAKED-IN Latin text regions that are
-    # NOT in our text segments — these are stylized labels inside
-    # diagrams (e.g. "Build"/"Design" in the sprint circles) that
-    # ocrmypdf did not pick up. A naive full-page flip would render
-    # these as reversed glyphs ("dliuB"/"ngiseD"), which is unreadable
-    # and flagged by review as a blocker. We preserve the region
-    # contents so that after the page mirror we can paste them back
-    # UN-flipped at the mirrored coordinate, keeping the layout
-    # mirrored while local text stays readable.
+    # BEFORE flipping, capture every Latin-text-shaped region on the page
+    # — both on plain background and inside illustrations/diagrams — so
+    # that after the full-page flip we can paste these patches back
+    # UN-FLIPPED at their mirrored position. Rationale:
+    #   * The page flip is the right behaviour for image GEOMETRY: stair
+    #     diagrams, infinity loops, gear illustrations mirror so visual
+    #     flow matches right-to-left reading (the user wants this).
+    #   * But Latin TEXT glyphs and brand LOGOS baked into those images
+    #     must NOT mirror — "DEV" flipping to "VED", "Build" to "dliuB",
+    #     "AGILE" to "ELIGA", or a docker/git/aws logo reversing left-to-
+    #     right all destroy readability and brand recognition.
+    # The solution is selective un-flip: whole-page flip for geometry,
+    # then paste un-flipped text patches on top at the mirrored coord,
+    # so each Latin label or logo stays readable in place while its
+    # surrounding illustration mirrors around it.
+    #
+    # ``_collect_baked_latin_regions`` already runs OCR + a morphological
+    # text-line detector and returns text-shaped rectangles anywhere on
+    # the page. We do NOT pass image_regions as protected here — we WANT
+    # to un-flip Latin text INSIDE images too.
     baked_latin: list[tuple[int, int, int, int, "Image.Image"]] = []
     if rtl:
-        # Rotated-text bboxes must be excluded from the un-flip set —
-        # they'll be re-drawn with translated Arabic on top, and pasting
-        # the original Latin glyph patch there would show through any
-        # transparent regions of the rotated-Arabic layer.
         rotated_bboxes = [
             box for seg, box in scaled_boxes
             if int(seg.meta.get("rotation", 0) or 0)
@@ -1045,8 +1082,14 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
     # so the translated words land where their LTR counterparts would after
     # a reading-order flip.
     if rtl:
+        # Full-page horizontal flip — images, graphics, and illustrations
+        # all mirror for right-to-left visual flow.
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
-        # Restore baked-in Latin patches UN-flipped at mirrored positions.
+        # Selective un-flip of Latin text/logos. The full-page flip
+        # reversed every Latin glyph; paste the pre-flip patches back
+        # un-flipped at their mirrored position so labels like "DEV",
+        # "OPS", "Build", "Design", "AGILE", "docker", brand logos,
+        # etc. stay readable on top of the mirrored illustration.
         for rx0, ry0, rx1, ry1, patch in baked_latin:
             mx0 = img_w - rx1
             img.paste(patch, (mx0, ry0))
@@ -1278,6 +1321,153 @@ def _collect_baked_latin_regions(arr, text_mask, protected_bboxes=None):
     return regions
 
 
+def _collect_image_regions(page, arr, scale: float, text_mask=None):
+    """Return pixel-space rectangles (and un-flipped pixel copies) for
+    photo/diagram regions on the page — coloured raster content likely
+    to hold baked-in Latin text (people, charts, diagrams, logos). Used
+    by the PIL render path to paste these regions back UN-FLIPPED at
+    their mirrored position after the page-wide RTL flip, so any
+    English labels inside photos stay readable regardless of style.
+
+    Detection strategy (in order of preference):
+      1. Query the PDF for raster-image xobject bboxes. This is
+         precise when available, but ocrmypdf and other PDF rewriters
+         often collapse/flatten the xobject graph, returning empty or
+         only-full-page results — useless for our purposes.
+      2. Fall back to content-based detection on the rasterized page:
+         large contiguous regions of coloured/textured pixels (i.e.
+         not near-white page background) are flagged as "photo
+         regions". Connected components of the saturation/chroma mask
+         give us the bounding boxes. This works on any rendered page
+         independent of PDF structure.
+
+    Regions that cover >=85% of the page area are skipped (they are
+    the page background, not a content image). Regions smaller than
+    ~0.5in on either side are skipped (decorative icons — mirroring
+    is acceptable and often correct for directional arrows).
+    """
+    import numpy as np
+    try:
+        import cv2
+    except Exception:
+        cv2 = None
+
+    h, w = arr.shape[:2]
+    page_area = max(1, w * h)
+    min_side = max(40, int(round(0.5 * 72 * scale)))
+    seen_boxes: list[tuple[int, int, int, int]] = []
+    candidates: list[tuple[int, int, int, int]] = []
+
+    # Strategy 1: use PDF image-xobject bboxes when available.
+    try:
+        infos = page.get_image_info(xrefs=True)
+    except Exception:
+        try:
+            infos = page.get_image_info()
+        except Exception:
+            infos = []
+    for info in infos or []:
+        bbox = info.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        try:
+            bx0, by0, bx1, by1 = (float(v) for v in bbox)
+        except Exception:
+            continue
+        ix0 = max(0, int(round(bx0 * scale)))
+        iy0 = max(0, int(round(by0 * scale)))
+        ix1 = min(w, int(round(bx1 * scale)))
+        iy1 = min(h, int(round(by1 * scale)))
+        if ix1 - ix0 < min_side or iy1 - iy0 < min_side:
+            continue
+        area = (ix1 - ix0) * (iy1 - iy0)
+        if area / page_area >= 0.85:
+            continue
+        candidates.append((ix0, iy0, ix1, iy1))
+
+    # Strategy 2: content-based photo-region detection on arr. Run
+    # even when strategy 1 returned candidates — ocrmypdf sometimes
+    # preserves metadata for SOME images but drops others on the same
+    # page, so we merge both result sets.
+    if cv2 is not None:
+        try:
+            hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+            sat = hsv[:, :, 1]
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            # Photo mask: coloured pixels (sat >= 30) OR mid-grey
+            # pixels (not near-white page bg AND not near-black text).
+            # Near-white page bg is gray >= 230; near-black text is
+            # gray <= 60. The middle band + coloured pixels = photo.
+            photo_mask = (sat >= 30) | ((gray >= 60) & (gray <= 220))
+            # Exclude translated-text-bbox regions so filled bg doesn't
+            # get included as "photo".
+            if text_mask is not None:
+                photo_mask = photo_mask & (~text_mask)
+            pm = photo_mask.astype(np.uint8) * 255
+            # Dilate generously to merge nearby photo-like patches into
+            # coherent image regions.
+            k = max(12, int(round(0.25 * 72 * scale)))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            pm = cv2.morphologyEx(pm, cv2.MORPH_CLOSE, kernel)
+            # Drop small isolated blobs (text runs, icons).
+            min_blob_side = max(min_side, int(round(0.8 * 72 * scale)))
+            n, _, stats, _ = cv2.connectedComponentsWithStats(pm, connectivity=8)
+            for i in range(1, n):
+                x, y, rw, rh, _a = stats[i]
+                if rw < min_blob_side or rh < min_blob_side:
+                    continue
+                area = rw * rh
+                if area / page_area >= 0.85:
+                    continue
+                candidates.append((int(x), int(y), int(x + rw), int(y + rh)))
+        except Exception:
+            pass
+
+    out: list = []
+    for (ix0, iy0, ix1, iy1) in candidates:
+        ix0 = max(0, ix0); iy0 = max(0, iy0)
+        ix1 = min(w, ix1); iy1 = min(h, iy1)
+        if ix1 - ix0 < min_side or iy1 - iy0 < min_side:
+            continue
+        # De-dupe — accept only candidates not overlapping an
+        # already-accepted region by more than 60% of the smaller one.
+        dup = False
+        for sx0, sy0, sx1, sy1 in seen_boxes:
+            jx0 = max(ix0, sx0); jy0 = max(iy0, sy0)
+            jx1 = min(ix1, sx1); jy1 = min(iy1, sy1)
+            if jx1 <= jx0 or jy1 <= jy0:
+                continue
+            inter = (jx1 - jx0) * (jy1 - jy0)
+            a = (ix1 - ix0) * (iy1 - iy0)
+            b = (sx1 - sx0) * (sy1 - sy0)
+            if inter / max(1, min(a, b)) > 0.6:
+                dup = True
+                break
+        if dup:
+            continue
+        patch = arr[iy0:iy1, ix0:ix1].copy()
+        # Reject flat layout elements (callout backgrounds, dividers,
+        # rounded banner rectangles) that the content-mask grabbed along
+        # with actual photos. Photos/diagrams have either meaningful
+        # colour saturation or high tonal variation; a uniform gray
+        # rectangle has neither. Un-flipping those regions is what
+        # creates phantom empty-box duplicates next to the real mirrored
+        # callout. Keep the check cheap — we already ran opencv above.
+        if cv2 is not None:
+            try:
+                patch_hsv = cv2.cvtColor(patch, cv2.COLOR_RGB2HSV)
+                sat_mean = float(patch_hsv[:, :, 1].mean())
+                patch_gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+                gray_std = float(patch_gray.std())
+                if sat_mean < 12.0 and gray_std < 30.0:
+                    continue
+            except Exception:
+                pass
+        seen_boxes.append((ix0, iy0, ix1, iy1))
+        out.append((ix0, iy0, ix1, iy1, patch))
+    return out
+
+
 def _int_to_rgb_tuple(color_int) -> tuple[int, int, int]:
     try:
         v = int(color_int)
@@ -1399,6 +1589,21 @@ def _draw_text_in_bbox(
     """
     x0, y0, x1, y1 = box
     box_w = max(1, x1 - x0)
+    # The extracted bbox is sized to the source text's glyph extents
+    # (often narrower than the surrounding container because the source
+    # paragraph didn't fill its card/column to the edge). Arabic glyphs
+    # tend to be wider than Latin at the same point size, and also carry
+    # longer lexical equivalents, so wrapping into the exact source-width
+    # frequently produces 1-2-word narrow columns in place of a natural
+    # paragraph. Widen the effective wrap width by a small factor for RTL
+    # targets so the paragraph breathes out to match its container.
+    # Downstream logic still anchors text to the original bbox's
+    # right-edge (RTL) or left-edge (LTR), so the text just flows a bit
+    # further into the adjacent whitespace — it does not collide with
+    # neighbouring segments (those have their own bboxes/redactions).
+    if rtl:
+        box_w = int(box_w * 1.25)
+    x0, y0, x1, y1 = box
     direction = "rtl" if rtl else "ltr"
     features = ["kern", "liga"]
     lang = _raqm_lang_for(target_lang)
@@ -1415,17 +1620,23 @@ def _draw_text_in_bbox(
     pieces = [p.strip() for p in text.split("\n") if p.strip()]
     if not pieces:
         return
-    # Stack only when EVERY line is a real multi-word phrase (≥2 words)
-    # AND each line is ≤3 words. A single-word line (e.g. "السباق" or
-    # "II") is almost never an intentional title break — it's the LLM
-    # adding a stray newline to a short caption like "Sprint II", which
-    # we then flatten into one line so the caption reads as a single
-    # phrase rather than two stacked words. True stacked wordmarks
-    # (e.g. "WATERFALL\nMODEL" → translated to two ≥2-word phrases)
-    # still preserve their break.
+    # Stack only when this is plausibly a TRUE multi-line wordmark / heading —
+    # a short, visually-stacked title where the newline is intentional. Three
+    # conditions must all hold:
+    #   * exactly 2–3 pieces (a wordmark rarely stacks into more)
+    #   * every piece is a real multi-word phrase (≥2 words, ≤3 words)
+    #   * the TOTAL text is short (≤10 words across all pieces)
+    # Otherwise the newlines are just OCR/LLM artefacts inside a flowing
+    # body paragraph and MUST be flattened into one line that gets
+    # re-wrapped at the bbox width. Without this check, a long Arabic
+    # body translation returned as "إزالة الحواجز\nبين التطوير\n..." would
+    # be rendered as a tall column of 2-word lines instead of a normal
+    # paragraph — the "cards with narrow 1-word wrapping" bug.
+    total_words = sum(len(p.split()) for p in pieces)
     multiword_short = (
-        len(pieces) > 1
+        2 <= len(pieces) <= 3
         and all(2 <= len(p.split()) <= 3 for p in pieces)
+        and total_words <= 10
     )
     if multiword_short:
         forced_lines: list[str] = pieces
