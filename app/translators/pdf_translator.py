@@ -92,8 +92,16 @@ class PdfTranslator(Translator):
         # single paragraph so the translator gets the full sentence context and
         # the translated text flows naturally (critical for RTL languages where
         # splitting a sentence mid-thought breaks word order).
-        segments = _drop_ocr_noise(segments)
+        # ORDER MATTERS: merge first, then drop noise. Otherwise a valid
+        # caption like "Sprint I" loses its "I" token to the noise drop
+        # (single char, low font_size estimate from OCR) before the
+        # merger gets a chance to glue it onto the preceding "Sprint".
+        # The lost token then leaves an un-translated Latin glyph in
+        # the source bitmap that the un-flip pass later restores at the
+        # mirrored position, producing a stray English letter next to
+        # the Arabic translation.
         segments = _merge_horizontal_tokens(segments)
+        segments = _drop_ocr_noise(segments)
         segments = _merge_vertical_paragraphs(segments)
         # Wordmarks rendered as two stacked OCR lines (think the
         # "WATERFALL\nMODEL" two-line bug logo on a slide) come out
@@ -1465,6 +1473,20 @@ def _draw_text_in_bbox(
             wrapped_lines.extend(
                 _char_wrap(draw, forced, font, box_w, direction, features, lang)
             )
+    # Caption-style fallback. When the text was wrapped into multiple
+    # lines AND the SOURCE had only one line worth of words (≤4 across
+    # all forced_lines), prefer to render it as ONE line that overflows
+    # horizontally. Stacking a 2-word translation like "السباق الأول"
+    # into two short lines under a circle reads as a malformed pair of
+    # words; the same content on one line that extends slightly past
+    # the source bbox is the correct caption shape.
+    total_words_in_source = sum(len(p.split()) for p in forced_lines)
+    if (
+        wrapped_lines is not None
+        and len(wrapped_lines) > len(forced_lines)
+        and total_words_in_source <= 4
+    ):
+        wrapped_lines = list(forced_lines)
     if not wrapped_lines:
         return
     line_h = _line_height(font)
@@ -1527,50 +1549,79 @@ def _draw_rotated_text_in_bbox(
         canvas_w, canvas_h = bh, bw
     else:
         canvas_w, canvas_h = bw, bh
-    # Vertical wordmarks should fill the column without wrapping.
-    # Search for the LARGEST font size that draws ``text`` as a SINGLE
-    # line whose width fits ``canvas_w`` AND whose height fits
-    # ``canvas_h``. Starting at canvas_h (max sensible font height)
-    # and stepping down keeps Arabic words at a similar visual weight
-    # to the source Latin wordmark — without this auto-fit, Arabic
-    # letters at the source's nominal pt size leave a thin word
-    # floating in an empty tall bbox.
+    layer = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    layer_draw = ImageDraw.Draw(layer)
     if rotation in (90, 270):
-        layer_for_metrics = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
-        metrics_draw = ImageDraw.Draw(layer_for_metrics)
+        # Wordmark-style direct draw. We need pixel-precise placement
+        # so the rotated word fills the column without clipping or
+        # floating in empty space; the generic ``_draw_text_in_bbox``
+        # uses getmetrics-based line heights that over-estimate ink
+        # extent and pushes the glyph above the canvas top, producing
+        # the "disconnected/clipped letters" the reviewer kept seeing.
+        # Always bold for vertical wordmarks — the source ``AGILE``-
+        # style label is invariably set in heavy weight so the caps
+        # read as a marquee, and a regular-weight Arabic translation
+        # at the same point size visually disappears in the column.
+        bold = True
         direction = "rtl" if rtl else "ltr"
         features = ["kern", "liga"]
         lang = _raqm_lang_for(target_lang)
-        best = font_size
-        # Start from the column's short dimension and walk down — most
-        # rotated bbox aspect ratios (e.g. 1:4 or 1:8 for a wordmark)
-        # leave large headroom on the long axis so the largest font
-        # that fits without wrapping is much bigger than the caller's
-        # source-pt-size hint.
-        upper = max(font_size, int(canvas_h * 1.5))
-        for trial in range(upper, max(font_size - 1, 8), -2):
+        # Pick the largest font whose ACTUAL ink bbox fits both canvas
+        # dimensions. textbbox is the right measure for single-line
+        # placement; we'll position by that bbox so nothing clips.
+        best_size = max(font_size, 8)
+        best_bbox = None
+        upper = max(font_size, int(canvas_h * 2))
+        for trial in range(upper, 7, -2):
             test_font = _load_pil_font(target_lang, trial, bold, italic, font_cache)
             try:
-                bbox = metrics_draw.textbbox(
+                bb = layer_draw.textbbox(
                     (0, 0), text, font=test_font,
                     direction=direction, features=features, language=lang,
                 )
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
             except Exception:
-                tw = _text_width(metrics_draw, text, test_font, direction, features, lang)
-                th = _line_height(test_font)
+                continue
+            tw = bb[2] - bb[0]
+            th = bb[3] - bb[1]
             if tw <= canvas_w and th <= canvas_h:
-                best = trial
+                best_size = trial
+                best_bbox = bb
                 break
-        font_size = best
-    layer = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-    layer_draw = ImageDraw.Draw(layer)
-    _draw_text_in_bbox(
-        layer_draw, text, (0, 0, canvas_w, canvas_h),
-        target_lang=target_lang, rtl=rtl, font_size=font_size,
-        color=color, bold=bold, italic=italic, font_cache=font_cache,
-    )
+        chosen = _load_pil_font(target_lang, best_size, bold, italic, font_cache)
+        if best_bbox is None:
+            try:
+                best_bbox = layer_draw.textbbox(
+                    (0, 0), text, font=chosen,
+                    direction=direction, features=features, language=lang,
+                )
+            except Exception:
+                best_bbox = (0, 0, canvas_w, canvas_h)
+        bb_left, bb_top, bb_right, bb_bottom = best_bbox
+        tw = bb_right - bb_left
+        th = bb_bottom - bb_top
+        # Centre the visible glyph bbox within the canvas. The
+        # ``draw.text`` API places the text such that ``(x, y)`` is the
+        # TOP-LEFT of the bounding box's origin, NOT of the visible
+        # glyphs — subtract bb_left / bb_top so the glyphs land where
+        # we want them centred.
+        x = (canvas_w - tw) // 2 - bb_left
+        y = (canvas_h - th) // 2 - bb_top
+        try:
+            layer_draw.text(
+                (x, y), text, font=chosen, fill=color,
+                direction=direction, features=features, language=lang,
+            )
+        except Exception:
+            try:
+                layer_draw.text((x, y), text, font=chosen, fill=color)
+            except Exception:
+                pass
+    else:
+        _draw_text_in_bbox(
+            layer_draw, text, (0, 0, canvas_w, canvas_h),
+            target_lang=target_lang, rtl=rtl, font_size=font_size,
+            color=color, bold=bold, italic=italic, font_cache=font_cache,
+        )
     rotated = layer.rotate(rotation, expand=True, resample=Image.BICUBIC)
     # Centre the rotated layer on the bbox centre so small rotation-induced
     # size mismatches don't nudge text out of place.
