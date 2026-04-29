@@ -20,6 +20,37 @@ _BULLET_RE = re.compile(
     re.UNICODE,
 )
 
+
+# Source PDFs from PowerPoint exports embed glyphs from Symbol / Wingdings /
+# decorative fonts (smart quotes, en/em dashes, dingbat arrows, bullets) that
+# either survive the pipeline as visible tofu (no glyph in our render fonts)
+# or confuse the LLM with non-ASCII punctuation. Normalise to ASCII-or-near-
+# ASCII equivalents at extraction time so both translation and render work
+# with characters every font in our archive can draw.
+_SOURCE_UNICODE_NORMALIZE = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "–": "-", "—": "-", "−": "-",
+    "…": "...",
+    " ": " ",
+    "→": "->", "➔": "->", "➜": "->", "➝": "->",
+    "➞": "->", "➡": "->", "⮕": "->", "⬅": "<-",
+    "←": "<-", "⇒": "=>", "⇐": "<=",
+    "": "->", "": "->", "": "->",  # Symbol-font arrows
+    "•": "•",  # keep U+2022 BULLET (most fonts have it)
+}
+
+
+def _sanitize_source_unicode(s: str) -> str:
+    """Replace decorative / Symbol-font glyphs the source PDF carries with
+    safe equivalents so they survive translation and render without tofu."""
+    if not s:
+        return s
+    out = []
+    for ch in s:
+        out.append(_SOURCE_UNICODE_NORMALIZE.get(ch, ch))
+    return "".join(out)
+
 _SAVE_KW = dict(
     garbage=4,
     deflate=True,
@@ -198,7 +229,9 @@ class PdfTranslator(Translator):
                 #
                 # (b) Native text page: the existing redact-then-htmlbox path
                 #     which works fine for simple digital text PDFs.
-                if _is_rasterized_page(page):
+                if _is_rasterized_page(page) or (
+                    rtl and _page_has_baked_latin_image(page)
+                ):
                     _render_page_via_pil(
                         page, page_segs, target_lang=target_lang, rtl=rtl,
                     )
@@ -211,12 +244,43 @@ class PdfTranslator(Translator):
                         images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
                         graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                     )
+                    # Belt-and-suspenders: paint a solid fill rect over every
+                    # segment bbox. Some PowerPoint / Keynote PDF exports
+                    # render text as vector PATHS rather than glyph runs, and
+                    # redaction with PDF_REDACT_LINE_ART_NONE deliberately
+                    # leaves line-art alone (so diagrams survive). Without
+                    # this overlay, those path-rendered code glyphs survive
+                    # and become visible — and mirror-flipped — after the
+                    # page-wide RTL flip below.
+                    for seg, fill in zip(page_segs, fills):
+                        try:
+                            page.draw_rect(
+                                pymupdf.Rect(seg.meta["bbox"]),
+                                color=fill, fill=fill, width=0, overlay=True,
+                            )
+                        except Exception:
+                            pass
                     page_w = float(page.rect.width)
-                    if rtl and page_w > 0:
+                    page_mirror = _page_should_mirror(page_segs, rtl, page=page)
+                    if page_mirror and page_w > 0:
                         _apply_rtl_page_mirror(page, page_w)
                     for seg in page_segs:
                         bbox = seg.meta["bbox"]
-                        if rtl and page_w > 0:
+                        seg_text = (seg.translated or seg.text or "")
+                        text_has_arabic = any(
+                            "؀" <= ch <= "ۿ" or "ݐ" <= ch <= "ݿ" for ch in seg_text
+                        )
+                        seg_dir_meta = (seg.meta.get("direction") or "auto").lower()
+                        if text_has_arabic:
+                            seg_rtl = True
+                        else:
+                            seg_rtl = rtl if seg_dir_meta == "auto" else (seg_dir_meta == "rtl")
+                        seg_dir_attr = "rtl" if seg_rtl else "ltr"
+                        # Mirror the bbox only when the page itself is
+                        # flipped. On unflipped pages each segment stays
+                        # at its source position; the seg_dir_attr alone
+                        # controls reading order inside the box.
+                        if page_mirror and page_w > 0:
                             rect = pymupdf.Rect(
                                 page_w - bbox[2],
                                 bbox[1],
@@ -226,7 +290,7 @@ class PdfTranslator(Translator):
                         else:
                             rect = pymupdf.Rect(bbox)
                         _draw_segment(
-                            page, rect, seg, font_family, dir_attr, archive, css,
+                            page, rect, seg, font_family, seg_dir_attr, archive, css,
                         )
             doc.save(str(out_path), **_SAVE_KW)
         finally:
@@ -708,7 +772,7 @@ def _segment_from_lines(
         if line_parts:
             text_parts.append("".join(line_parts))
 
-    text = "\n".join(text_parts).strip()
+    text = _sanitize_source_unicode("\n".join(text_parts)).strip()
     if not text or x0 == float("inf"):
         return None
 
@@ -965,6 +1029,50 @@ def _detect_rotated_text_on_page(page, start_id: int) -> list:
     return results
 
 
+def _page_should_mirror(segs, rtl: bool, page=None) -> bool:
+    """Per-page mirror decision. Only mirror pages where doing so cannot
+    break content. Three gates:
+
+      1. Don't mirror if the page has any substantial baked image content
+         (logos, screenshots, code panels rendered as raster). These often
+         carry text we can't extract or reliably un-flip.
+      2. Don't mirror if any LTR-direction segment occupies a meaningful
+         slice of the page (>3% area). One mirrored code block ruins the
+         page; the upside of flipping the surrounding Arabic prose is
+         small compared to that cost.
+      3. Among the remaining pages, mirror only when RTL/auto segments
+         outweigh LTR segments by area.
+    """
+    if not rtl:
+        return False
+    if page is not None and _page_has_baked_latin_image(page, threshold=0.02):
+        return False
+    page_w = float(page.rect.width) if page is not None else 0.0
+    page_h = float(page.rect.height) if page is not None else 0.0
+    page_area = max(1.0, page_w * page_h)
+    ltr_area = 0.0
+    other_area = 0.0
+    for seg in segs:
+        bbox = seg.meta.get("bbox")
+        if not bbox:
+            continue
+        area = max(0.0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        seg_text = (seg.translated or seg.text or "")
+        text_has_arabic = any(
+            "؀" <= ch <= "ۿ" or "ݐ" <= ch <= "ݿ" for ch in seg_text
+        )
+        seg_dir = (seg.meta.get("direction") or "auto").lower()
+        if not text_has_arabic and seg_dir == "ltr":
+            ltr_area += area
+        else:
+            other_area += area
+    if page is not None and ltr_area / page_area > 0.03:
+        return False
+    if ltr_area + other_area <= 0:
+        return True
+    return other_area >= ltr_area
+
+
 def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 200) -> None:
     """Render the page to a PIL image, paint translated text onto it using
     a real Arabic font + proper shaping, then REPLACE the page's content with
@@ -999,6 +1107,12 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
     page_h = float(page_rect.height)
     if page_w <= 0 or page_h <= 0:
         return
+
+    # Per-page mirror gating: only flip pages whose translated content is
+    # predominantly RTL AND that have no significant baked image content.
+    # Code-dominant pages and image-heavy pages stay unflipped so their
+    # baked content never has to be un-flipped patch-by-patch.
+    page_mirror = _page_should_mirror(segs, rtl, page=page)
 
     scale = dpi / 72.0
     pix = page.get_pixmap(dpi=dpi, alpha=False, annots=False)
@@ -1066,7 +1180,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
     # the page. We do NOT pass image_regions as protected here — we WANT
     # to un-flip Latin text INSIDE images too.
     baked_latin: list[tuple[int, int, int, int, "Image.Image"]] = []
-    if rtl:
+    if page_mirror:
         rotated_bboxes = [
             box for seg, box in scaled_boxes
             if int(seg.meta.get("rotation", 0) or 0)
@@ -1081,7 +1195,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
     # diagram etc. is flipped; we'll draw Arabic text at mirrored bboxes
     # so the translated words land where their LTR counterparts would after
     # a reading-order flip.
-    if rtl:
+    if page_mirror:
         # Full-page horizontal flip — images, graphics, and illustrations
         # all mirror for right-to-left visual flow.
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -1101,19 +1215,43 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
         if not text:
             continue
         bullet = seg.meta.get("bullet", "")
+        # Bullet placement convention: visual right edge of the line for an
+        # RTL-target page. For LTR-direction segments (URLs, code) on an
+        # RTL page this means appending the bullet to the logical end so
+        # bidi puts it on the right; for native-RTL segments the bullet
+        # naturally lands at the right edge when prepended.
+        seg_dir_pre = (seg.meta.get("direction") or "auto").lower()
         if bullet:
-            text = f"{bullet} {text}"
+            if rtl and seg_dir_pre == "ltr":
+                text = f"{text} {bullet}"
+            else:
+                text = f"{bullet} {text}"
         rotation = int(seg.meta.get("rotation", 0) or 0)
-        if rtl:
-            # Mirror the bbox around the image's vertical centre line. A
-            # horizontal page flip also flips rotation direction: 90° CCW
-            # becomes 270° CCW (and vice versa) when viewed in the mirror.
+        # Direction selection. Hard rule: any segment containing ANY
+        # Arabic codepoint is rendered RTL, regardless of what the LLM
+        # tagged it. Mixed Arabic+Latin blocks (e.g. an Arabic sentence
+        # with an embedded code identifier) belong on an RTL page reading
+        # right-to-left, with the Latin run flipping inside the Arabic
+        # paragraph via standard bidi. Pure-Latin segments keep whatever
+        # the LLM decided (defaulting to LTR).
+        text_has_arabic = any(
+            "؀" <= ch <= "ۿ" or "ݐ" <= ch <= "ݿ" for ch in text
+        )
+        seg_dir = (seg.meta.get("direction") or "auto").lower()
+        if text_has_arabic:
+            seg_rtl = True
+        else:
+            seg_rtl = rtl if seg_dir == "auto" else (seg_dir == "rtl")
+        # Bbox mirroring is gated on the PAGE-level mirror decision —
+        # not on the document-level rtl flag — so unflipped pages keep
+        # bboxes at their source positions for both LTR and RTL segments.
+        if page_mirror:
             mx0 = img_w - ix1
             mx1 = img_w - ix0
             ix0, ix1 = mx0, mx1
-            if rotation == 90:
+            if seg_rtl and rotation == 90:
                 rotation = 270
-            elif rotation == 270:
+            elif seg_rtl and rotation == 270:
                 rotation = 90
 
         color = _int_to_rgb_tuple(seg.meta.get("color", 0))
@@ -1123,7 +1261,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
         if rotation in (90, 270):
             _draw_rotated_text_in_bbox(
                 img, text, (ix0, iy0, ix1, iy1),
-                target_lang=target_lang, rtl=rtl,
+                target_lang=target_lang, rtl=seg_rtl,
                 font_size=font_size, color=color,
                 bold=bold, italic=italic,
                 font_cache=font_cache, rotation=rotation,
@@ -1137,7 +1275,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
                 text,
                 (ix0, iy0, ix1, iy1),
                 target_lang=target_lang,
-                rtl=rtl,
+                rtl=seg_rtl,
                 font_size=font_size,
                 color=color,
                 bold=bold,
@@ -1219,6 +1357,13 @@ def _collect_baked_latin_regions(arr, text_mask, protected_bboxes=None):
         except Exception:
             data = None
         if data is not None:
+            # Group word-level OCR boxes by (block, paragraph, line) so we
+            # can emit one patch per LINE. Pasting word-sized patches back
+            # un-flipped at their mirrored positions reverses the words'
+            # relative order along the line ("public class Main" reads as
+            # "Main class public" after the mirror). A single line-sized
+            # patch keeps the words' intra-line layout intact.
+            line_groups: dict[tuple[int, int, int], list[tuple[int, int, int, int]]] = {}
             for i, txt in enumerate(data.get("text", [])):
                 if not txt or not txt.strip():
                     continue
@@ -1235,11 +1380,24 @@ def _collect_baked_latin_regions(arr, text_mask, protected_bboxes=None):
                 try:
                     x = int(data["left"][i]); y = int(data["top"][i])
                     rw = int(data["width"][i]); rh = int(data["height"][i])
+                    block = int(data.get("block_num", [0])[i] or 0)
+                    par = int(data.get("par_num", [0])[i] or 0)
+                    line = int(data.get("line_num", [0])[i] or 0)
                 except Exception:
                     continue
                 if rw < 6 or rh < 6:
                     continue
-                candidates.append((x, y, x + rw, y + rh))
+                line_groups.setdefault((block, par, line), []).append(
+                    (x, y, x + rw, y + rh)
+                )
+            for boxes in line_groups.values():
+                if not boxes:
+                    continue
+                lx0 = min(b[0] for b in boxes)
+                ly0 = min(b[1] for b in boxes)
+                lx1 = max(b[2] for b in boxes)
+                ly1 = max(b[3] for b in boxes)
+                candidates.append((lx0, ly0, lx1, ly1))
 
     if cv2 is not None:
         # Morphological text-line detection: adaptive binary threshold
@@ -1251,17 +1409,24 @@ def _collect_baked_latin_regions(arr, text_mask, protected_bboxes=None):
                 gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                 cv2.THRESH_BINARY_INV, 15, 5,
             )
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
-            dilated = cv2.dilate(th, kernel, iterations=2)
+            # Wider horizontal kernel so an entire line of text merges into
+            # a single connected blob rather than separate word blobs. This
+            # mirrors the OCR-side line-grouping above so morph-detected
+            # patches also un-flip as whole lines instead of words.
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 2))
+            dilated = cv2.dilate(th, kernel, iterations=3)
             n, _, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
             for i in range(1, n):
                 x, y, rw, rh, _area = stats[i]
                 if rw < 15 or rh < 8:
                     continue
-                if rw > 400 or rh > 60:
+                # Allow line-wide blobs (whole code lines can be 800px+
+                # wide). Cap at near-page-width so the page background
+                # doesn't get treated as one giant text region.
+                if rw > int(w * 0.85) or rh > 60:
                     continue
                 ar = rw / max(1, rh)
-                if ar < 1.0 or ar > 15:
+                if ar < 1.0 or ar > 60:
                     continue
                 candidates.append((x, y, x + rw, y + rh))
         except Exception:
@@ -1500,17 +1665,25 @@ def _sample_local_bg(arr, text_mask, box, ring: int = 16):
     return np.median(clean, axis=0).astype(np.uint8)
 
 
-def _load_pil_font(target_lang: str, size: int, bold: bool, italic: bool, cache: dict):
-    """Load a TTF font suitable for ``target_lang`` at ``size`` pixels. Caches
-    to avoid reloading per segment.
+def _load_pil_font(
+    target_lang: str, size: int, bold: bool, italic: bool, cache: dict,
+    text: str = "",
+):
+    """Load a TTF font suitable for ``target_lang`` at ``size`` pixels.
+    Caches to avoid reloading per segment.
 
-    Font priority for Arabic:
-      1. Cairo (variable font, modern geometric sans, covers BOTH Arabic AND
-         Latin scripts in a single file — essential for rendering mixed
-         Arabic+English text like "API" or "DevOps" without tofu squares).
-      2. Noto Sans Arabic (Arabic-only — picks up any Arabic glyph Cairo
-         happens to lack).
-      3. Noto Sans (Latin fallback).
+    Arabic font priority depends on the segment's script content because
+    Noto Naskh Arabic has no Latin glyphs (Latin in a Naskh-only segment
+    renders as tofu rectangles). The selector chooses:
+
+      - PURE ARABIC text → Noto Naskh Arabic (the project's preferred
+        traditional naskh, matches the HTML path's font_for()).
+      - Arabic mixed with any Latin → Cairo (a single TTF covering BOTH
+        Arabic AND Latin so embedded Latin words/code/identifiers render
+        cleanly without falling out of the font).
+      - Pure Latin or other → Noto Sans.
+
+    Always falls back through Noto Sans for unsupported glyphs.
     """
     from PIL import ImageFont
 
@@ -1521,42 +1694,44 @@ def _load_pil_font(target_lang: str, size: int, bold: bool, italic: bool, cache:
     arabic_codes = {"ar", "fa", "ur", "ckb", "ps", "sd"}
     hebrew_codes = {"he", "iw", "yi"}
     fonts_dir = settings.fonts_dir
-    key = (code, size, bold, italic)
+    has_arabic = any("؀" <= ch <= "ۿ" or "ݐ" <= ch <= "ݿ" for ch in text)
+    has_latin = any("A" <= ch <= "Z" or "a" <= ch <= "z" for ch in text)
+    key = (code, size, bold, italic, has_arabic, has_latin)
     if key in cache:
         return cache[key]
+    candidates: list[tuple[str, bool]] = []  # (filename, supports_variation)
     if code in arabic_codes:
-        cairo_path = fonts_dir / "Cairo-Variable.ttf"
-        if cairo_path.exists():
-            try:
-                font = ImageFont.truetype(str(cairo_path), size)
+        if has_arabic:
+            # Any segment with Arabic content must use Noto Naskh for the
+            # Arabic glyphs — that is the project's required Arabic face.
+            # Mixed Arabic+Latin segments still use Naskh; Latin runs inside
+            # them get whatever Latin coverage Naskh ships with (and degrade
+            # gracefully via Noto Sans if a glyph is missing). Never use a
+            # sans Arabic face like Cairo for Arabic — that violates the
+            # font requirement.
+            candidates.append(("NotoNaskhArabic-Bold.ttf" if bold else "NotoNaskhArabic-Regular.ttf", False))
+        else:
+            # Pure-Latin segment on an Arabic-target page (URL, code,
+            # identifier). Use a Latin face so glyphs are sharp.
+            candidates.append(("NotoSans-Regular.ttf", False))
+    elif code in hebrew_codes:
+        candidates.append(("NotoSansHebrew-Regular.ttf", False))
+    candidates.append(("NotoSans-Regular.ttf", False))
+    for name, supports_var in candidates:
+        path = fonts_dir / name
+        if not path.exists():
+            continue
+        try:
+            font = ImageFont.truetype(str(path), size)
+            if supports_var:
                 try:
                     font.set_variation_by_axes([700.0 if bold else 400.0])
                 except Exception:
                     pass
-                cache[key] = font
-                return font
-            except Exception:
-                pass
-        # Cairo missing — fall back to Arabic-only Noto fonts (may show tofu
-        # on embedded Latin runs; that's the cost of the fallback path).
-        candidates = [
-            "NotoSansArabic-Bold.ttf" if bold else "NotoSansArabic-Regular.ttf",
-            "NotoNaskhArabic-Bold.ttf" if bold else "NotoNaskhArabic-Regular.ttf",
-        ]
-    elif code in hebrew_codes:
-        candidates = ["NotoSansHebrew-Regular.ttf"]
-    else:
-        candidates = []
-    candidates.append("NotoSans-Regular.ttf")
-    for name in candidates:
-        path = fonts_dir / name
-        if path.exists():
-            try:
-                font = ImageFont.truetype(str(path), size)
-                cache[key] = font
-                return font
-            except Exception:
-                continue
+            cache[key] = font
+            return font
+        except Exception:
+            continue
     font = ImageFont.load_default()
     cache[key] = font
     return font
@@ -1662,7 +1837,7 @@ def _draw_text_in_bbox(
     # within that overflow budget.
     overflow_budget = box_h * 1.4
     for size in size_options:
-        font = _load_pil_font(target_lang, size, bold, italic, font_cache)
+        font = _load_pil_font(target_lang, size, bold, italic, font_cache, text=text)
         candidate: list[str] = []
         ok = True
         for forced in forced_lines:
@@ -1678,7 +1853,7 @@ def _draw_text_in_bbox(
             wrapped_lines = candidate
             break
     if wrapped_lines is None:
-        font = _load_pil_font(target_lang, max(10, size_options[-1]), bold, italic, font_cache)
+        font = _load_pil_font(target_lang, max(10, size_options[-1]), bold, italic, font_cache, text=text)
         wrapped_lines = []
         for forced in forced_lines:
             wrapped_lines.extend(
@@ -1784,7 +1959,7 @@ def _draw_rotated_text_in_bbox(
         best_bbox = None
         upper = max(font_size, int(canvas_h * 2))
         for trial in range(upper, 7, -2):
-            test_font = _load_pil_font(target_lang, trial, bold, italic, font_cache)
+            test_font = _load_pil_font(target_lang, trial, bold, italic, font_cache, text=text)
             try:
                 bb = layer_draw.textbbox(
                     (0, 0), text, font=test_font,
@@ -1798,7 +1973,7 @@ def _draw_rotated_text_in_bbox(
                 best_size = trial
                 best_bbox = bb
                 break
-        chosen = _load_pil_font(target_lang, best_size, bold, italic, font_cache)
+        chosen = _load_pil_font(target_lang, best_size, bold, italic, font_cache, text=text)
         if best_bbox is None:
             try:
                 best_bbox = layer_draw.textbbox(
@@ -2415,6 +2590,33 @@ def _is_rasterized_page(page) -> bool:
         if w * h >= 0.9 * page_area:
             return True
     return False
+
+
+def _page_has_baked_latin_image(page, threshold: float = 0.20) -> bool:
+    """True when raster images on the page cover at least ``threshold`` of the
+    page area. Used for RTL targets so any page carrying a substantial
+    image — which may have baked-in Latin text (code panels, UI screenshots,
+    figure labels) — is routed through the PIL render path. The PIL path
+    runs selective un-flip on detected Latin-text patches after the page
+    mirror, which the HTML path cannot do."""
+    try:
+        infos = page.get_image_info(xrefs=True)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    page_area = page.rect.width * page.rect.height
+    if page_area <= 0:
+        return False
+    covered = 0.0
+    for info in infos:
+        bbox = info.get("bbox")
+        if not bbox:
+            continue
+        w = max(0.0, float(bbox[2]) - float(bbox[0]))
+        h = max(0.0, float(bbox[3]) - float(bbox[1]))
+        covered += w * h
+    return covered >= threshold * page_area
 
 
 def _page_has_visual_content(page) -> bool:

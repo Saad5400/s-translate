@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Callable, Iterable
 from urllib.parse import urlparse
 
@@ -257,26 +258,69 @@ class LLMClient:
         if parsed is None:
             raise LLMError(f"Could not parse JSON response: {content[:200]}")
 
-        # Match back by id.
-        #   Missing key          -> fall back to original text (LLM lost it).
-        #   Empty string ("")    -> LLM flagged as OCR noise; mark dropped
-        #                           so the renderer can skip it (prompt rule 12).
-        #   Non-empty string     -> normal translated value.
+        # Each value may be a plain string (legacy/short form) OR a JSON
+        # object with richer per-segment metadata the LLM decided itself —
+        # see SYSTEM_PROMPT for the schema. We never hard-code what counts
+        # as code/brand/URL: the model labels each segment, the renderer
+        # honours the labels.
         for seg in chunk:
-            if seg.id in parsed:
-                translated = parsed[seg.id]
-                if isinstance(translated, str):
-                    if translated == "":
-                        seg.translated = ""
-                        seg.meta["_ocr_noise"] = True
-                    else:
-                        seg.translated = _normalize_target_text(translated, target_lang)
-                else:
-                    log.warning("segment %s has non-string translation; keeping original", seg.id)
-                    seg.translated = seg.meta.get("_original_text", seg.text)
-            else:
+            if seg.id not in parsed:
                 log.warning("segment %s missing in response; keeping original", seg.id)
                 seg.translated = seg.meta.get("_original_text", seg.text)
+                continue
+            decision = _coerce_seg_value(parsed[seg.id])
+            if decision is None:
+                log.warning("segment %s has unusable response value; keeping original", seg.id)
+                seg.translated = seg.meta.get("_original_text", seg.text)
+                continue
+            for k, v in decision.meta.items():
+                seg.meta[k] = v
+            if decision.keep_source:
+                seg.translated = seg.meta.get("_original_text", seg.text)
+            elif decision.text == "":
+                seg.translated = ""
+                seg.meta["_ocr_noise"] = True
+            else:
+                seg.translated = _normalize_target_text(decision.text, target_lang)
+
+
+@dataclass
+class _SegDecision:
+    text: str
+    meta: dict
+    keep_source: bool = False
+
+
+def _coerce_seg_value(value) -> "_SegDecision | None":
+    """Normalize an LLM-returned segment value into a decision the loop above
+    can apply. Accepts either a plain string (translated text) or a JSON
+    object with richer fields the model picked itself:
+      - ``translation``: target-language text (used when translating).
+      - ``translate``: bool — if false, keep the source verbatim. The
+        model uses this for code, identifiers, URLs, brand names, and
+        anything else it judges should not change.
+      - ``direction``: "ltr"/"rtl"/"auto" — natural reading direction.
+      - ``kind``: free-form label (e.g. "code", "url", "brand", "prose")
+        the renderer can use for future styling without a parser change.
+    Unknown keys are ignored — the model can experiment freely.
+    """
+    if isinstance(value, str):
+        return _SegDecision(text=value, meta={})
+    if not isinstance(value, dict):
+        return None
+    meta: dict = {}
+    direction = value.get("direction")
+    if isinstance(direction, str) and direction.lower() in ("ltr", "rtl", "auto"):
+        meta["direction"] = direction.lower()
+    kind = value.get("kind")
+    if isinstance(kind, str) and kind:
+        meta["kind"] = kind
+    if value.get("translate") is False:
+        return _SegDecision(text="", meta=meta, keep_source=True)
+    raw = value.get("translation")
+    if isinstance(raw, str):
+        return _SegDecision(text=raw, meta=meta)
+    return None
 
 
 _ARABIC_ROMAN_ORDINAL = {

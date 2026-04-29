@@ -1,23 +1,18 @@
 """Conditionally OCR PDFs so the rest of the pipeline sees extractable text.
 
-Why `--force-ocr`: `--skip-text` and `--redo-ocr` both leave mixed pages'
-image-baked text un-OCR'd — which is exactly what this project needs to
-translate on brochures, posters and marketing PDFs. So OCR is run in force
-mode whenever OCR is needed at all.
+Strategy: prefer `--skip-text`. Pages that already have a digital text layer
+keep that layer verbatim — no re-rasterisation, no tesseract misreads of
+clean source glyphs (this is what made `2nd` come out as `2110`, `https`
+as `httos`, `public` as `oublic`, etc.). Pages with no extractable text get
+OCR'd as before. This trades: some image-baked text on MIXED pages (native
+text plus extra text inside an embedded picture) won't be surfaced — which
+is acceptable for the typical academic / report PDF. Brochures and marketing
+decks where every page is fully image-baked still work because their pages
+have no native text and therefore still trigger OCR.
 
-Why CONDITIONAL: force-OCR rasterises every page, and for native digital
-PDFs that already have perfect text extraction this destroys the 1:1 input-
-to-output visual match the user is looking for (fonts become JPEG noise,
-vector art gets baked into the image, file size balloons). So before running
-OCR we first check whether ANY page actually needs it — a page needs OCR when
-it contains images whose combined area is meaningful relative to the page,
-AND the native text extraction off the page is thin compared to that image
-area (suggesting the image carries text the OCR needs to surface). If every
-page looks like a clean native-text page, we skip OCR entirely and return the
-input unchanged so the downstream pipeline works off the original PDF.
-
-Returns the input path unchanged when OCR fails OR is skipped, so the caller
-never needs to know whether OCR ran.
+`_pdf_needs_ocr` skips the OCR pass entirely when no page in the document
+has image-only-text content worth extracting; this preserves perfect 1:1
+fidelity for clean digital PDFs.
 """
 from __future__ import annotations
 
@@ -56,7 +51,7 @@ def maybe_ocr_pdf(src: Path, work_dir: Path) -> Path:
     def _run(optimize: str) -> tuple[int, str]:
         cmd = [
             "ocrmypdf",
-            "--force-ocr",
+            "--skip-text",
             "--optimize", optimize,
             "--jobs", str(jobs),
             "--quiet",
