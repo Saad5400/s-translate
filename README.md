@@ -20,19 +20,38 @@ Self-hostable web app that translates `.docx`, `.pdf`, `.pptx`, `.xlsx`, and `.t
 - **Gradio UI** at `/`, **REST API** at `POST /api/jobs` (async) or `POST /api/translate` (sync).
 - **Docker**-ready with bundled LibreOffice + Noto fonts.
 
-## Quick start (local)
+## Quick start (one script)
+
+Download or clone the repo, then run the launcher for your OS. It installs
+[`uv`](https://docs.astral.sh/uv/) if needed, syncs Python deps into a local
+`.venv`, builds the web UI if `npm` is available, starts the server, and opens
+your browser at `http://127.0.0.1:7860`.
+
+**macOS / Linux:**
+```bash
+./run.sh
+```
+
+**Windows:** double-click `run.cmd`, or from PowerShell:
+```powershell
+.\run.ps1
+```
+
+The launcher warns (but does not fail) if optional system binaries are missing
+and prints the exact install command for your platform:
+
+- **LibreOffice** — needed to convert `.doc`/`.ppt` legacy formats
+- **Tesseract** (+ Arabic langpack) — needed for image-only PDF OCR
+- **Ghostscript** — needed by `ocrmypdf`
+
+Override host/port via env vars: `HOST=0.0.0.0 PORT=8080 ./run.sh`.
+
+### Manual setup (without the launcher)
 
 ```bash
-# Python backend
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-
-# Web UI (Vite + React + Tailwind + Radix + cmdk)
-npm --prefix app/web install
-npm --prefix app/web run build
-
-.venv/bin/python -m app.main
-# open http://localhost:7860
+uv sync
+npm --prefix app/web install && npm --prefix app/web run build
+uv run python -m app.main
 ```
 
 During UI development, `npm --prefix app/web run dev` runs Vite on port 5173
