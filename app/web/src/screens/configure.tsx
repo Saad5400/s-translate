@@ -46,9 +46,8 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
   const onShared = usingSharedKey(cfg);
 
   const sharedProvider = shared ? findProvider(shared.provider) : null;
-  const sharedModel = shared?.model || sharedProvider?.models[0]?.id || "";
-  const sharedNote =
-    shared?.note || sharedProvider?.sharedCaveat || "";
+  const sharedModel = sharedProvider?.models[0]?.id || "";
+  const sharedNote = sharedProvider?.sharedCaveat || "";
 
   function pickShared() {
     if (!shared || !sharedProvider) return;
@@ -57,7 +56,7 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
       keyMode: "shared",
       providerId: shared.provider,
       model: sharedModel,
-      apiBase: shared.api_base || sharedProvider.defaultBase,
+      apiBase: sharedProvider.defaultBase,
       apiKey: "",
     });
   }

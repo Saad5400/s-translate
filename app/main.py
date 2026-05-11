@@ -127,21 +127,17 @@ def create_app() -> FastAPI:
 
     @fastapi_app.get("/api/config")
     async def public_config() -> dict:
-        """Expose deploy-level knobs the UI needs to render correctly.
+        """Tell the UI which provider this deploy has a shared API key for.
 
-        ``shared`` describes the single provider for which this deploy ships
-        an API key, so the UI can offer a "use shared key" option without
-        the user pasting their own. Selection logic:
+        Selection:
+        1. ``SHARED_KEY_PROVIDER`` env wins when set.
+        2. Otherwise auto-detect: if exactly one known provider key env is
+           set, advertise that provider. Multiple → ``shared=null`` (admin
+           must disambiguate with SHARED_KEY_PROVIDER).
 
-        1. If ``SHARED_KEY_PROVIDER`` env is set, that's the chosen provider
-           (admin's responsibility to also set the matching key env).
-        2. Otherwise, scan the known provider key envs; if exactly one is
-           set, advertise that provider. Multiple matches → ``shared=null``
-           (admin must disambiguate via SHARED_KEY_PROVIDER).
-
-        ``model``, ``api_base``, and ``note`` are optional overrides; UI
-        falls back to its built-in per-provider defaults when missing.
-        Nothing about the key value itself is returned.
+        The UI handles default model, api_base, and caveat note from its
+        own per-provider table — no need for server-side string overrides.
+        Nothing about the key value is returned.
         """
         import os
 
@@ -170,17 +166,7 @@ def create_app() -> FastAPI:
                     ", ".join(detected),
                 )
 
-        if not chosen:
-            return {"shared": None}
-
-        shared: dict[str, str] = {"provider": chosen}
-        if model := os.environ.get("SHARED_KEY_MODEL", "").strip():
-            shared["model"] = model
-        if api_base := os.environ.get("SHARED_KEY_API_BASE", "").strip():
-            shared["api_base"] = api_base
-        if note := os.environ.get("SHARED_KEY_NOTE", "").strip():
-            shared["note"] = note
-        return {"shared": shared}
+        return {"shared": {"provider": chosen} if chosen else None}
 
     # --- Async job-based translate ------------------------------------------
     @fastapi_app.post("/api/jobs")

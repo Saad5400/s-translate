@@ -51,8 +51,8 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
       ...local,
       keyMode: "shared",
       providerId: shared.provider,
-      model: shared.model || sharedProvider.models[0]?.id || local.model,
-      apiBase: shared.api_base || sharedProvider.defaultBase,
+      model: sharedProvider.models[0]?.id || local.model,
+      apiBase: sharedProvider.defaultBase,
       apiKey: "",
     });
   }

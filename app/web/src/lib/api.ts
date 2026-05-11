@@ -4,16 +4,9 @@
 export type BackendJobStatus = "queued" | "running" | "done" | "failed";
 
 export interface SharedKey {
-  /** Provider ID this deploy ships a shared API key for. */
+  /** Provider ID this deploy ships a shared API key for. The UI looks up
+   *  the default model, api_base, and caveat note from PROVIDERS[provider]. */
   provider: string;
-  /** Optional default model when the user picks the shared key. UI falls
-   *  back to PROVIDERS[provider].models[0].id if omitted. */
-  model?: string;
-  /** Optional api_base override (defaults to the provider's standard one). */
-  api_base?: string;
-  /** Optional server-side override for the caveat shown next to the
-   *  "use shared key" button. UI falls back to PROVIDERS[provider].sharedCaveat. */
-  note?: string;
 }
 
 export interface ServerConfig {
