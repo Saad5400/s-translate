@@ -13,7 +13,13 @@ import { Input, Textarea } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
 import { SecretField } from "@/components/ui/secret-field";
-import { type Config, isConfigured, providerNeedsKey, useStoreSubscription } from "@/lib/store";
+import {
+  type Config,
+  getSharedKey,
+  isConfigured,
+  useStoreSubscription,
+  usingSharedKey,
+} from "@/lib/store";
 import { PROVIDERS, findProvider } from "@/lib/data";
 
 interface Props {
@@ -35,8 +41,21 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
   useStoreSubscription();
   const provider = findProvider(local.providerId);
   const valid = isConfigured(local);
-  const sharedKeyAvailable =
-    local.providerId !== "ollama" && !providerNeedsKey(local.providerId);
+  const shared = getSharedKey();
+  const onShared = usingSharedKey(local);
+  const sharedProvider = shared ? findProvider(shared.provider) : null;
+
+  function applyShared() {
+    if (!shared || !sharedProvider) return;
+    setLocal({
+      ...local,
+      keyMode: "shared",
+      providerId: shared.provider,
+      model: shared.model || sharedProvider.models[0]?.id || local.model,
+      apiBase: shared.api_base || sharedProvider.defaultBase,
+      apiKey: "",
+    });
+  }
 
   const providerOptions: ComboboxOption[] = PROVIDERS.map((p) => ({
     value: p.id,
@@ -83,6 +102,17 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
         </DialogHeader>
 
         <DialogBody>
+          {shared && sharedProvider && !onShared && (
+            <div className="p-3 rounded-md border border-accent-line bg-accent-soft flex items-center justify-between gap-3 text-[13px]">
+              <div className="text-paper-1">
+                يوفّر هذا الخادم مفتاحًا مشتركًا لمزوِّد{" "}
+                <span className="font-mono text-paper-0">{sharedProvider.name}</span>.
+              </div>
+              <Button variant="accent" size="sm" onClick={applyShared}>
+                استخدمه
+              </Button>
+            </div>
+          )}
           {enforceGate && (
             <div className="p-3 rounded-md border border-[oklch(0.82_0.13_82/0.3)] bg-[oklch(0.82_0.13_82/0.08)] flex gap-3 items-start text-[13px]">
               <AlertTriangle className="h-4 w-4 text-warn shrink-0 mt-0.5" />
@@ -101,11 +131,16 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
                 value={local.providerId}
                 onChange={(v) => {
                   const p = findProvider(v);
+                  // Switching to a non-shared provider implicitly leaves
+                  // shared mode; keep "shared" only when picking the matching
+                  // provider so the badge stays accurate.
+                  const stayShared = shared && shared.provider === p.id;
                   setLocal({
                     ...local,
                     providerId: p.id,
                     apiBase: p.defaultBase,
                     model: p.models[0]?.id || local.model,
+                    keyMode: stayShared ? local.keyMode : "own",
                   });
                 }}
                 options={providerOptions}
@@ -126,21 +161,19 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
             <div className="grid gap-2">
               <Label>
                 مفتاح الـ API
-                {sharedKeyAvailable && (
+                {onShared && (
                   <span className="text-paper-3 text-[11px] font-mono">
                     {" "}
-                    · اختياري
+                    · يستخدم مفتاح الخادم
                   </span>
                 )}
               </Label>
               <SecretField
                 value={local.apiKey}
-                onChange={(v) => setLocal({ ...local, apiKey: v })}
-                placeholder={
-                  sharedKeyAvailable
-                    ? "اتركه فارغًا لاستخدام مفتاح الخادم"
-                    : provider.keyHint || "sk-…"
+                onChange={(v) =>
+                  setLocal({ ...local, apiKey: v, keyMode: v.trim() ? "own" : local.keyMode })
                 }
+                placeholder={provider.keyHint || "sk-…"}
               />
             </div>
             <div className="grid gap-2">

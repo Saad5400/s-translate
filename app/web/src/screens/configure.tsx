@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, Sparkles, KeyRound, FlipHorizontal2, Loader2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Sparkles, KeyRound, FlipHorizontal2, Loader2, ServerCog, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHead, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -15,7 +15,7 @@ import {
   findLang,
   findProvider,
 } from "@/lib/data";
-import { providerNeedsKey, useStoreSubscription, type Config } from "@/lib/store";
+import { getSharedKey, useStoreSubscription, usingSharedKey, type Config } from "@/lib/store";
 import type { StagedFile } from "./upload";
 import { fmtSize, cn } from "@/lib/utils";
 
@@ -30,21 +30,48 @@ interface Props {
 }
 
 export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isRtl, starting = false }: Props) {
-  // Re-render when /api/config arrives so the key field can flip from required
-  // to optional once we learn the server has a shared key for this provider.
+  // Re-render when /api/config arrives so the mode gate can show up once we
+  // know whether the server has a shared key available.
   useStoreSubscription();
   const provider = findProvider(cfg.providerId);
   const targetLang = findLang(cfg.target);
   const BackIcon = isRtl ? ArrowRight : ArrowLeft;
   const ForwardIcon = isRtl ? ArrowLeft : ArrowRight;
 
-  const needsKey = providerNeedsKey(cfg.providerId);
-  const sharedKeyAvailable = cfg.providerId !== "ollama" && !needsKey;
+  const shared = getSharedKey();
+  // Show the two-button gate when the server has a shared key and the user
+  // hasn't yet committed to a mode. Once they pick, the choice persists and
+  // they see only the relevant form.
+  const showModeGate = !!shared && cfg.keyMode === null;
+  const onShared = usingSharedKey(cfg);
+
+  const sharedProvider = shared ? findProvider(shared.provider) : null;
+  const sharedModel = shared?.model || sharedProvider?.models[0]?.id || "";
+  const sharedNote =
+    shared?.note || sharedProvider?.sharedCaveat || "";
+
+  function pickShared() {
+    if (!shared || !sharedProvider) return;
+    setCfg({
+      ...cfg,
+      keyMode: "shared",
+      providerId: shared.provider,
+      model: sharedModel,
+      apiBase: shared.api_base || sharedProvider.defaultBase,
+      apiKey: "",
+    });
+  }
+  function pickOwn() {
+    setCfg({ ...cfg, keyMode: "own" });
+  }
+
+  const needsOwnKey = !onShared && cfg.providerId !== "ollama";
   const canStart =
+    !showModeGate &&
     !!cfg.target &&
     !!cfg.shape &&
     !!cfg.model.trim() &&
-    (!needsKey || !!cfg.apiKey.trim());
+    (!needsOwnKey || !!cfg.apiKey.trim());
 
   const langOptions: ComboboxOption[] = LANGUAGES.map((l) => ({
     value: l.code,
@@ -104,6 +131,104 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
           ))}
         </div>
       </Card>
+
+      {showModeGate && shared && sharedProvider && (
+        <Card>
+          <CardHead>
+            <CardTitle>كيف تريد تشغيل الترجمة؟</CardTitle>
+            <span className="text-micro" style={{ color: "var(--color-paper-3)" }}>
+              اختر مرّة واحدة · يمكنك تغيير اختيارك لاحقًا
+            </span>
+          </CardHead>
+          <div className="grid md:grid-cols-2 gap-3">
+            <button
+              type="button"
+              onClick={pickShared}
+              className={cn(
+                "group grid gap-3 p-5 rounded-md border bg-ink-1 text-start cursor-pointer transition-all",
+                "border-accent bg-gradient-to-b from-[oklch(0.74_0.15_155/0.08)] to-ink-1 shadow-[inset_0_0_0_1px_var(--color-accent-line)]",
+                "hover:bg-ink-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-line"
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-2">
+                  <ServerCog className="h-4 w-4 text-accent" />
+                  <span className="font-semibold text-[15px]">
+                    استخدم مفتاح الخادم المشترك
+                  </span>
+                </div>
+                <Badge>مُوصى به · مجاني لك</Badge>
+              </div>
+              <div className="grid gap-1 text-[13px] text-paper-1">
+                <div>
+                  المزوِّد:{" "}
+                  <span className="font-mono text-paper-0">{sharedProvider.name}</span>
+                </div>
+                {sharedModel && (
+                  <div>
+                    النموذج الافتراضي:{" "}
+                    <span className="font-mono text-paper-0">{sharedModel}</span>
+                  </div>
+                )}
+              </div>
+              {sharedNote && (
+                <div className="p-3 rounded-md border border-[oklch(0.82_0.13_82/0.3)] bg-[oklch(0.82_0.13_82/0.08)] flex gap-2 items-start text-[12px]">
+                  <AlertTriangle className="h-3.5 w-3.5 text-warn shrink-0 mt-0.5" />
+                  <div className="text-paper-1">{sharedNote}</div>
+                </div>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={pickOwn}
+              className={cn(
+                "group grid gap-3 p-5 rounded-md border border-line bg-ink-1 text-start cursor-pointer transition-all",
+                "hover:bg-ink-2 hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-line"
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-2">
+                  <KeyRound className="h-4 w-4 text-paper-2" />
+                  <span className="font-semibold text-[15px]">
+                    استخدم مفتاحك الخاص
+                  </span>
+                </div>
+              </div>
+              <div className="text-[13px] text-paper-2">
+                اختر مزوِّدًا ونموذجًا وأدخل مفتاح الـ API الخاص بك. مفيد عندما تريد
+                التحكّم الكامل أو استخدام مزوِّد آخر.
+              </div>
+            </button>
+          </div>
+        </Card>
+      )}
+
+      {onShared && !showModeGate && shared && sharedProvider && (
+        <div className="flex items-center justify-between gap-3 px-4 py-3 rounded-md border border-accent-line bg-accent-soft">
+          <div className="inline-flex items-center gap-2 text-[13px]">
+            <ServerCog className="h-4 w-4 text-accent" />
+            <span className="text-paper-1">
+              تستخدم مفتاح الخادم المشترك ·{" "}
+              <span className="font-mono text-paper-0">{sharedProvider.name}</span>
+              {cfg.model && (
+                <>
+                  {" "}
+                  · <span className="font-mono text-paper-0">{cfg.model}</span>
+                </>
+              )}
+            </span>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setCfg({ ...cfg, keyMode: "own" })}
+          >
+            <KeyRound className="h-3.5 w-3.5" />
+            استخدم مفتاحًا خاصًا
+          </Button>
+        </div>
+      )}
 
       <div className="grid lg:grid-cols-[1fr_2fr] gap-4">
         <Card>
@@ -190,91 +315,81 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
         </Card>
       </div>
 
-      <Card>
-        <CardHead>
-          <CardTitle>بيانات اعتماد الذكاء الاصطناعي</CardTitle>
-          <span className="text-micro" style={{ color: "var(--color-paper-3)" }}>
-            تُستخدم فقط خلال هذه الطلبية · لا تُخزَّن على الخادم
-          </span>
-        </CardHead>
+      {!onShared && !showModeGate && (
+        <Card>
+          <CardHead>
+            <CardTitle>بيانات اعتماد الذكاء الاصطناعي</CardTitle>
+            <span className="text-micro" style={{ color: "var(--color-paper-3)" }}>
+              تُستخدم فقط خلال هذه الطلبية · لا تُخزَّن على الخادم
+            </span>
+          </CardHead>
 
-        <div className="grid md:grid-cols-2 gap-4">
-          <div className="grid gap-2">
-            <Label>المزوِّد</Label>
-            <Combobox
-              ariaLabel="المزوِّد"
-              value={cfg.providerId}
-              onChange={(v) => {
-                const p = findProvider(v);
-                setCfg({
-                  ...cfg,
-                  providerId: p.id,
-                  apiBase: p.defaultBase,
-                  model: p.models[0]?.id || cfg.model,
-                });
-              }}
-              options={providerOptions}
-            />
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="grid gap-2">
+              <Label>المزوِّد</Label>
+              <Combobox
+                ariaLabel="المزوِّد"
+                value={cfg.providerId}
+                onChange={(v) => {
+                  const p = findProvider(v);
+                  setCfg({
+                    ...cfg,
+                    providerId: p.id,
+                    apiBase: p.defaultBase,
+                    model: p.models[0]?.id || cfg.model,
+                  });
+                }}
+                options={providerOptions}
+              />
+            </div>
+
+            <div className="grid gap-2">
+              <Label>اسم النموذج</Label>
+              <Combobox
+                ariaLabel="النموذج"
+                value={cfg.model}
+                onChange={(v) => setCfg({ ...cfg, model: v })}
+                options={modelOptions}
+                placeholder="ابحث أو اكتب اسمًا مخصّصًا"
+                allowCustom
+                monoValue
+              />
+            </div>
+
+            <div className="grid gap-2">
+              <Label>
+                <span className="inline-flex items-center gap-1.5">
+                  <KeyRound className="h-3 w-3" />
+                  مفتاح الـ API
+                </span>
+              </Label>
+              <SecretField
+                value={cfg.apiKey}
+                onChange={(v) => setCfg({ ...cfg, apiKey: v })}
+                placeholder={provider.keyHint || "sk-…"}
+              />
+            </div>
+
+            <div className="grid gap-2">
+              <Label>عنوان الـ API (اختياري)</Label>
+              <Input
+                dir="ltr"
+                className="font-mono text-[13px]"
+                value={cfg.apiBase}
+                onChange={(e) => setCfg({ ...cfg, apiBase: e.target.value })}
+                placeholder={provider.defaultBase || "https://…"}
+              />
+            </div>
           </div>
+        </Card>
+      )}
 
-          <div className="grid gap-2">
-            <Label>اسم النموذج</Label>
-            <Combobox
-              ariaLabel="النموذج"
-              value={cfg.model}
-              onChange={(v) => setCfg({ ...cfg, model: v })}
-              options={modelOptions}
-              placeholder="ابحث أو اكتب اسمًا مخصّصًا"
-              allowCustom
-              monoValue
-            />
-          </div>
-
-          <div className="grid gap-2">
-            <Label>
-              <span className="inline-flex items-center gap-1.5">
-                <KeyRound className="h-3 w-3" />
-                مفتاح الـ API
-                {sharedKeyAvailable && (
-                  <span className="text-paper-3 text-[11px] font-mono">
-                    · اختياري
-                  </span>
-                )}
-              </span>
-            </Label>
-            <SecretField
-              value={cfg.apiKey}
-              onChange={(v) => setCfg({ ...cfg, apiKey: v })}
-              placeholder={
-                sharedKeyAvailable
-                  ? "اتركه فارغًا لاستخدام مفتاح الخادم المشترك"
-                  : provider.keyHint || "sk-…"
-              }
-            />
-            {sharedKeyAvailable && (
-              <div className="text-[12px] text-paper-3">
-                الخادم يوفّر مفتاحًا مشتركًا لهذا المزوِّد؛ اتركه فارغًا للاستفادة منه، أو أدخل مفتاحك الخاص لتجاوزه.
-              </div>
-            )}
-          </div>
-
-          <div className="grid gap-2">
-            <Label>عنوان الـ API (اختياري)</Label>
-            <Input
-              dir="ltr"
-              className="font-mono text-[13px]"
-              value={cfg.apiBase}
-              onChange={(e) => setCfg({ ...cfg, apiBase: e.target.value })}
-              placeholder={provider.defaultBase || "https://…"}
-            />
-          </div>
-        </div>
-
-        <details className="mt-4">
-          <summary className="cursor-pointer text-paper-2 text-[13px] font-mono tracking-[0.06em] uppercase">
-            خيارات متقدمة
-          </summary>
-          <div className="grid md:grid-cols-2 gap-4 mt-3.5">
+      {!showModeGate && (
+        <Card>
+          <CardHead>
+            <CardTitle>خيارات متقدمة</CardTitle>
+          </CardHead>
+          <div className="grid md:grid-cols-2 gap-4">
             <div className="grid gap-2">
               <Label>درجة العشوائية</Label>
               <Input
@@ -308,8 +423,8 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
               />
             </div>
           </div>
-        </details>
-      </Card>
+        </Card>
+      )}
 
       <div className="flex items-center justify-between">
         <div className="text-micro">الخطوة ٢ من ٣</div>

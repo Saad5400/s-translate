@@ -3,19 +3,30 @@
 
 export type BackendJobStatus = "queued" | "running" | "done" | "failed";
 
+export interface SharedKey {
+  /** Provider ID this deploy ships a shared API key for. */
+  provider: string;
+  /** Optional default model when the user picks the shared key. UI falls
+   *  back to PROVIDERS[provider].models[0].id if omitted. */
+  model?: string;
+  /** Optional api_base override (defaults to the provider's standard one). */
+  api_base?: string;
+  /** Optional server-side override for the caveat shown next to the
+   *  "use shared key" button. UI falls back to PROVIDERS[provider].sharedCaveat. */
+  note?: string;
+}
+
 export interface ServerConfig {
-  /** Provider IDs for which the deploy already has an API key configured
-   *  server-side — the UI can drop the "key required" gate for these. */
-  shared_providers: string[];
+  shared: SharedKey | null;
 }
 
 export async function fetchServerConfig(): Promise<ServerConfig> {
   try {
     const r = await fetch("/api/config");
-    if (!r.ok) return { shared_providers: [] };
+    if (!r.ok) return { shared: null };
     return (await r.json()) as ServerConfig;
   } catch {
-    return { shared_providers: [] };
+    return { shared: null };
   }
 }
 

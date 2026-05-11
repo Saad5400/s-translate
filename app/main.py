@@ -129,28 +129,58 @@ def create_app() -> FastAPI:
     async def public_config() -> dict:
         """Expose deploy-level knobs the UI needs to render correctly.
 
-        ``shared_providers`` lists providers whose API key is configured
-        server-side via env — for those, the UI doesn't have to require the
-        user to paste their own key. Detection is purely env-var presence;
-        nothing about the key value is leaked.
+        ``shared`` describes the single provider for which this deploy ships
+        an API key, so the UI can offer a "use shared key" option without
+        the user pasting their own. Selection logic:
+
+        1. If ``SHARED_KEY_PROVIDER`` env is set, that's the chosen provider
+           (admin's responsibility to also set the matching key env).
+        2. Otherwise, scan the known provider key envs; if exactly one is
+           set, advertise that provider. Multiple matches → ``shared=null``
+           (admin must disambiguate via SHARED_KEY_PROVIDER).
+
+        ``model``, ``api_base``, and ``note`` are optional overrides; UI
+        falls back to its built-in per-provider defaults when missing.
+        Nothing about the key value itself is returned.
         """
         import os
 
         provider_env = {
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai": "OPENAI_API_KEY",
-            "deepseek": "DEEPSEEK_API_KEY",
+            "anthropic": ("ANTHROPIC_API_KEY",),
+            "openai": ("OPENAI_API_KEY",),
+            "deepseek": ("DEEPSEEK_API_KEY",),
             "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-            "groq": "GROQ_API_KEY",
-            "mistral": "MISTRAL_API_KEY",
-            "openrouter": "OPENROUTER_API_KEY",
+            "groq": ("GROQ_API_KEY",),
+            "mistral": ("MISTRAL_API_KEY",),
+            "openrouter": ("OPENROUTER_API_KEY",),
         }
-        shared: list[str] = []
-        for pid, envs in provider_env.items():
-            names = (envs,) if isinstance(envs, str) else envs
-            if any(os.environ.get(n) for n in names):
-                shared.append(pid)
-        return {"shared_providers": shared}
+
+        chosen = os.environ.get("SHARED_KEY_PROVIDER", "").strip().lower() or None
+        if chosen is None:
+            detected = [
+                pid for pid, envs in provider_env.items()
+                if any(os.environ.get(n) for n in envs)
+            ]
+            if len(detected) == 1:
+                chosen = detected[0]
+            elif len(detected) > 1:
+                log.warning(
+                    "multiple provider key envs set (%s); set SHARED_KEY_PROVIDER "
+                    "to disambiguate — falling back to no shared key",
+                    ", ".join(detected),
+                )
+
+        if not chosen:
+            return {"shared": None}
+
+        shared: dict[str, str] = {"provider": chosen}
+        if model := os.environ.get("SHARED_KEY_MODEL", "").strip():
+            shared["model"] = model
+        if api_base := os.environ.get("SHARED_KEY_API_BASE", "").strip():
+            shared["api_base"] = api_base
+        if note := os.environ.get("SHARED_KEY_NOTE", "").strip():
+            shared["note"] = note
+        return {"shared": shared}
 
     # --- Async job-based translate ------------------------------------------
     @fastapi_app.post("/api/jobs")

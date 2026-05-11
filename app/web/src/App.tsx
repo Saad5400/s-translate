@@ -16,7 +16,7 @@ import {
   loadRoute,
   saveRoute,
   isConfigured,
-  setSharedProviders,
+  setSharedKey,
   type Config,
 } from "@/lib/store";
 import {
@@ -81,11 +81,11 @@ function AppInner() {
 
   // Initial data load
   React.useEffect(() => {
-    // Server config tells us which providers have a shared key — needed
-    // before the configure screen renders so the key field can drop its
-    // "required" badge when applicable.
+    // Server config tells us whether a shared API key is available — needed
+    // before the configure screen renders so it can offer the "use shared
+    // key" mode gate.
     fetchServerConfig()
-      .then((c) => setSharedProviders(c.shared_providers))
+      .then((c) => setSharedKey(c.shared))
       .catch(() => {});
     listJobs(50)
       .then((list) => setJobs(list))

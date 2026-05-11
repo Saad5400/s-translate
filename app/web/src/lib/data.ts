@@ -67,6 +67,9 @@ export type Provider = {
   defaultBase: string;
   models: { id: string; note?: string }[];
   keyHint?: string;
+  /** Caveat shown when the server advertises a shared key for this provider —
+   *  helps the user weigh "use shared" vs "bring my own" honestly. */
+  sharedCaveat?: string;
 };
 
 // Real current model lists (2026). Custom model names are always allowed.
@@ -105,6 +108,8 @@ export const PROVIDERS: Provider[] = [
     name: "DeepSeek",
     defaultBase: "https://api.deepseek.com/v1",
     keyHint: "sk-…",
+    sharedCaveat:
+      "نموذج صيني — قد لا يكون الأفضل لكل المهام، وقد ينفد رصيد الرموز المشترك.",
     models: [
       { id: "deepseek-chat", note: "جيد في العربية · رخيص" },
       { id: "deepseek-reasoner" },

@@ -1040,8 +1040,9 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
 
     box_fills: list[np.ndarray] = []
     for _, (ix0, iy0, ix1, iy1) in scaled_boxes:
+        interior = _sample_bbox_interior_bg(arr, (ix0, iy0, ix1, iy1))
         local = _sample_local_bg(arr, text_mask, (ix0, iy0, ix1, iy1), ring=16)
-        fill = local if local is not None else page_bg
+        fill = interior if interior is not None else (local if local is not None else page_bg)
         arr[iy0:iy1, ix0:ix1] = fill
         box_fills.append(fill)
 
@@ -1096,7 +1097,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
 
     draw = ImageDraw.Draw(img)
     font_cache: dict[tuple[str, int, bool, bool], object] = {}
-    for seg, (ix0, iy0, ix1, iy1) in scaled_boxes:
+    for (seg, (ix0, iy0, ix1, iy1)), box_fill in zip(scaled_boxes, box_fills):
         text = (seg.translated or seg.text or "").strip()
         if not text:
             continue
@@ -1143,6 +1144,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
                 bold=bold,
                 italic=italic,
                 font_cache=font_cache,
+                constrain_to_box=_is_colored_fill(box_fill),
             )
 
     # Re-encode and replace the page content with this single image. JPEG
@@ -1476,6 +1478,17 @@ def _int_to_rgb_tuple(color_int) -> tuple[int, int, int]:
     return ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
 
 
+def _is_colored_fill(fill) -> bool:
+    try:
+        r, g, b = (int(v) for v in fill[:3])
+    except Exception:
+        return False
+    # Treat non-white layout fills (gray callouts, badges, coloured cards) as
+    # bounded containers. Plain white pages can tolerate vertical overflow into
+    # surrounding whitespace; coloured boxes cannot.
+    return max(abs(255 - r), abs(255 - g), abs(255 - b)) > 22
+
+
 def _sample_local_bg(arr, text_mask, box, ring: int = 16):
     """Median colour of pixels in a ``ring``-wide frame OUTSIDE ``box`` that
     are NOT inside any other text bbox. Returns a uint8 RGB array or None
@@ -1498,6 +1511,44 @@ def _sample_local_bg(arr, text_mask, box, ring: int = 16):
     if clean.size == 0:
         return None
     return np.median(clean, axis=0).astype(np.uint8)
+
+
+def _sample_bbox_interior_bg(arr, box):
+    """Dominant background colour inside a text bbox.
+
+    Text is usually a minority of the pixels in its bbox, while coloured
+    callout/card backgrounds are the majority. Quantizing and taking the modal
+    colour preserves those coloured containers better than sampling only the
+    outside ring, which can be white just beyond the container edge.
+    """
+    import numpy as np
+
+    x0, y0, x1, y1 = box
+    region = arr[y0:y1, x0:x1]
+    if region.size == 0:
+        return None
+    pixels = region.reshape(-1, 3)
+    if pixels.shape[0] > 120_000:
+        step = max(1, pixels.shape[0] // 120_000)
+        pixels = pixels[::step]
+    # Drop very dark ink pixels; they are usually glyph strokes, not fill.
+    lum = (
+        0.2126 * pixels[:, 0]
+        + 0.7152 * pixels[:, 1]
+        + 0.0722 * pixels[:, 2]
+    )
+    candidates = pixels[lum > 45]
+    if candidates.shape[0] < max(32, pixels.shape[0] * 0.2):
+        candidates = pixels
+    quant = (candidates // 12).astype(np.uint8)
+    colors, counts = np.unique(quant, axis=0, return_counts=True)
+    if len(colors) == 0:
+        return None
+    winner = colors[int(counts.argmax())]
+    cluster = candidates[(quant == winner).all(axis=1)]
+    if cluster.size == 0:
+        return None
+    return np.median(cluster, axis=0).astype(np.uint8)
 
 
 def _load_pil_font(target_lang: str, size: int, bold: bool, italic: bool, cache: dict):
@@ -1574,6 +1625,7 @@ def _draw_text_in_bbox(
     bold: bool,
     italic: bool,
     font_cache: dict,
+    constrain_to_box: bool = False,
 ) -> None:
     """Draw ``text`` into ``box`` using a proper language-appropriate font.
 
@@ -1587,6 +1639,9 @@ def _draw_text_in_bbox(
     and double-reverse, producing the unreadable mangled output the user
     was seeing.
     """
+    if rtl:
+        text = _protect_ltr_runs_for_bidi(text)
+
     x0, y0, x1, y1 = box
     box_w = max(1, x1 - x0)
     # The extracted bbox is sized to the source text's glyph extents
@@ -1601,10 +1656,10 @@ def _draw_text_in_bbox(
     # right-edge (RTL) or left-edge (LTR), so the text just flows a bit
     # further into the adjacent whitespace — it does not collide with
     # neighbouring segments (those have their own bboxes/redactions).
-    if rtl:
+    if rtl and not constrain_to_box:
         box_w = int(box_w * 1.25)
     x0, y0, x1, y1 = box
-    direction = "rtl" if rtl else "ltr"
+    direction = "rtl" if rtl and _contains_rtl(text) else "ltr"
     features = ["kern", "liga"]
     lang = _raqm_lang_for(target_lang)
 
@@ -1660,7 +1715,7 @@ def _draw_text_in_bbox(
     # rendered text would crash into the next paragraph below, so we
     # progressively shrink the font until the wrapped paragraph fits
     # within that overflow budget.
-    overflow_budget = box_h * 1.4
+    overflow_budget = box_h * (0.95 if constrain_to_box else 1.4)
     for size in size_options:
         font = _load_pil_font(target_lang, size, bold, italic, font_cache)
         candidate: list[str] = []
@@ -1710,21 +1765,61 @@ def _draw_text_in_bbox(
     # with an adjacent title below it (the "الشلال over النموذج overlap"
     # the reviewer flagged on the Waterfall page).
     y = y0 + (box_h - total_h) // 2
+    if constrain_to_box:
+        y = max(y0, y)
     for line in wrapped_lines:
         tw = _text_width(draw, line, font, direction, features, lang)
-        x = x1 - tw if rtl else x0
+        x = x1 if rtl else x0
         try:
-            draw.text(
-                (x, y), line, font=font, fill=color,
+            kwargs = dict(
+                font=font, fill=color,
                 direction=direction, features=features, language=lang,
             )
+            if rtl:
+                kwargs["anchor"] = "ra"
+            draw.text((x, y), line, **kwargs)
         except Exception:
             try:
-                draw.text((x, y), line, font=font, fill=color)
+                if rtl:
+                    draw.text((x - tw, y), line, font=font, fill=color)
+                else:
+                    draw.text((x, y), line, font=font, fill=color)
             except Exception:
                 pass
         y += line_h
     return
+
+
+_RTL_CHAR_RE = re.compile(r"[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]")
+_LTR_RUN_RE = re.compile(
+    r"(?<![\u2066\u200e])("
+    r"https?://[^\s\u0600-\u06ff]+"
+    r"|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"
+    r"|[A-Za-z][A-Za-z0-9._/+:#-]*"
+    r"|\d+(?:[.,:/-]\d+)+"
+    r")",
+    re.UNICODE,
+)
+
+
+def _contains_rtl(text: str) -> bool:
+    return bool(_RTL_CHAR_RE.search(text or ""))
+
+
+def _protect_ltr_runs_for_bidi(text: str) -> str:
+    """Keep Latin identifiers, emails, URLs, and numeric ranges readable inside
+    RTL lines by wrapping each run in Unicode LTR isolates.
+    """
+    if not text or not _contains_rtl(text):
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token.startswith("\u2066") or token.startswith("\u200e"):
+            return token
+        return f"\u2066{token}\u2069"
+
+    return _LTR_RUN_RE.sub(repl, text)
 
 
 def _draw_rotated_text_in_bbox(
