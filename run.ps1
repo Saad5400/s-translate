@@ -14,8 +14,10 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-$envHost = if ($env:HOST) { $env:HOST } else { '127.0.0.1' }
-$envPort = if ($env:PORT) { [int]$env:PORT } else { 7860 }
+# Capture explicit overrides from the caller's environment so the .env loader
+# below can't clobber them (e.g. `$env:HOST='0.0.0.0'; .\run.ps1`).
+$overrideHost = $env:HOST
+$overridePort = $env:PORT
 
 function Info($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host $m -ForegroundColor Green }
@@ -123,6 +125,10 @@ if (Test-Path .env) {
     }
   }
 }
+
+# Re-apply caller overrides on top of .env values.
+$envHost = if ($overrideHost) { $overrideHost } elseif ($env:HOST) { $env:HOST } else { '127.0.0.1' }
+$envPort = if ($overridePort) { [int]$overridePort } elseif ($env:PORT) { [int]$env:PORT } else { 7860 }
 
 # --- Python deps ------------------------------------------------------------
 Info "Installing Python dependencies (uv sync) ..."

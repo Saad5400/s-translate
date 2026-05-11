@@ -65,6 +65,11 @@ if _is_debug:
 def create_app() -> FastAPI:
     fastapi_app = FastAPI(title="s-trans", version="0.1.0")
 
+    # FIFO of pending job runners — every upload enqueues here and is drained
+    # by MAX_CONCURRENT_JOBS worker tasks started in _on_startup. Setting that
+    # env to 1 turns the app into a single-file-at-a-time server.
+    job_queue: asyncio.Queue = asyncio.Queue()
+
     # Sweep jobs older than JOB_TTL_DAYS on startup and then hourly.
     @fastapi_app.on_event("startup")
     async def _on_startup() -> None:
@@ -84,6 +89,21 @@ def create_app() -> FastAPI:
                 await _a.sleep(3600)
 
         _a.create_task(_sweep_loop())
+
+        async def _queue_worker() -> None:
+            while True:
+                runner = await job_queue.get()
+                try:
+                    await runner()
+                except Exception:
+                    log.exception("queued job runner raised")
+                finally:
+                    job_queue.task_done()
+
+        worker_count = max(1, settings.max_concurrent_jobs)
+        for _ in range(worker_count):
+            _a.create_task(_queue_worker())
+        log.info("job queue: %d worker(s)", worker_count)
 
     @fastapi_app.get("/health")
     async def health() -> dict:
@@ -144,6 +164,7 @@ def create_app() -> FastAPI:
                 status_code=200,
             )
 
+        queued_position = job_queue.qsize() + 1
         meta = jobs_mod.JobMeta(
             id=job_id,
             status="queued",
@@ -153,6 +174,7 @@ def create_app() -> FastAPI:
             output_mode=output_mode,
             input_name=safe_name,
             content_hash=content_hash,
+            message=f"Waiting in queue (#{queued_position})",
         )
         jobs_mod.save_meta(meta)
 
@@ -187,8 +209,9 @@ def create_app() -> FastAPI:
                     job_id, status="failed", error=str(exc), message="Failed"
                 )
 
-        # Run asynchronously without blocking the request.
-        asyncio.create_task(_runner())
+        # Hand the runner to the worker pool. Workers fire it concurrently up
+        # to MAX_CONCURRENT_JOBS; the rest wait in FIFO order.
+        await job_queue.put(_runner)
 
         return JSONResponse(
             {

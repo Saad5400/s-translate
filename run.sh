@@ -17,8 +17,10 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 cd "$SCRIPT_DIR"
 
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-7860}"
+# Capture explicit overrides from the calling shell so `.env` sourcing below
+# can't wipe them (e.g. `HOST=0.0.0.0 PORT=8080 ./run.sh`).
+_override_HOST="${HOST-}"
+_override_PORT="${PORT-}"
 
 c_red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 c_green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -62,7 +64,10 @@ install_uv() {
   fi
   # uv's installer drops an env file that updates PATH.
   for envf in "$HOME/.local/bin/env" "$HOME/.cargo/env"; do
-    [ -f "$envf" ] && . "$envf" || true
+    if [ -f "$envf" ]; then
+      # shellcheck disable=SC1090
+      . "$envf" || true
+    fi
   done
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 }
@@ -136,6 +141,11 @@ if [[ -f .env ]]; then
   source .env
   set +a
 fi
+
+# Re-apply caller overrides on top of whatever .env provided.
+HOST="${_override_HOST:-${HOST:-127.0.0.1}}"
+PORT="${_override_PORT:-${PORT:-7860}}"
+export HOST PORT
 
 # --- Python deps ------------------------------------------------------------
 c_blue "==> Installing Python dependencies (uv sync) ..."

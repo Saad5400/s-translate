@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     reuse_translations: bool = True
     default_chunk_tokens: int = 2500
     concurrent_chunks: int = 4
+    # Cap on whole-document jobs that may run in parallel. Every upload goes
+    # through a FIFO queue; this controls how many workers drain it. Set to 1
+    # for a shared server (jobs serialize so the box isn't overloaded), or
+    # higher when running locally on a powerful machine.
+    max_concurrent_jobs: int = 4
     # Soft cap on per-document conversation history (tokens). When the next
     # chunk's prompt would exceed this, the oldest user/assistant chunk-turn
     # pair is evicted while the system prompt and the document intro/context
