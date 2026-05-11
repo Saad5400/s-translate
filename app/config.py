@@ -9,8 +9,16 @@ class Settings(BaseSettings):
     max_upload_mb: int = 50
     temp_dir: Path = Path("/tmp/s-trans")
     log_level: str = "INFO"
+    log_file: Path | None = None  # default resolved to temp_dir/s-trans.log
+    reuse_translations: bool = True
     default_chunk_tokens: int = 2500
     concurrent_chunks: int = 4
+    # Soft cap on per-document conversation history (tokens). When the next
+    # chunk's prompt would exceed this, the oldest user/assistant chunk-turn
+    # pair is evicted while the system prompt and the document intro/context
+    # brief stay pinned. Use generous defaults for big-context models; smaller
+    # local models should lower this in their .env.
+    max_history_tokens: int = 96000
     libreoffice_bin: str = "soffice"
     fonts_dir: Path = Path(__file__).parent / "fonts"
     job_ttl_seconds: int = 7 * 24 * 3600  # 7 days

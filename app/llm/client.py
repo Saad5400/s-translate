@@ -17,18 +17,53 @@ from tenacity import (
 from ..config import settings
 from ..schemas import Segment
 from ..utils.errors import LLMError
-from .chunker import chunk_segments, mask_placeholders, unmask_placeholders
+from .chunker import (
+    _approx_tokens,
+    chunk_segments,
+    mask_placeholders,
+    unmask_placeholders,
+)
 from .prompts import (
     CONTEXT_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    build_chunk_user_message,
     build_context_user_message,
-    build_user_message,
+    build_document_intro_message,
+    build_user_message,  # noqa: F401  (legacy export, kept for callers)
 )
 
 log = logging.getLogger(__name__)
 
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+# Context-brief sizing. Starts large for big-context models; halves on
+# provider-side "too long" errors down to the minimum before giving up.
+_MIN_CONTEXT_EXCERPT_CHARS = 3000
+_MAX_CONTEXT_BRIEF_CHARS = 12000
+
+# Substrings that providers use in error messages when the prompt
+# exceeds their context window. Matched case-insensitively.
+_CONTEXT_LENGTH_ERROR_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "max_tokens",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "request too large",
+    "string too long",
+)
+
+
+class _ContextTooLongError(Exception):
+    """Raised internally when the provider rejects an excerpt as too long."""
+
+
+def _is_context_length_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CONTEXT_LENGTH_ERROR_MARKERS)
 
 
 def resolve_ollama_base(api_base: str | None) -> str | None:
@@ -85,9 +120,9 @@ class LLMClient:
         segments: list[Segment],
         target_lang: str,
         source_lang: str | None = None,
-        max_chars: int = 6000,
+        max_chars: int = 60000,
     ) -> str:
-        """Build a short domain-context brief from the document's own text.
+        """Build a domain-context brief from the document's own text.
 
         The brief is fed into every translate_segments call so the LLM can pick
         the correct domain-specific terminology instead of literal word-for-word
@@ -95,43 +130,89 @@ class LLMClient:
         the extracted segments so very long documents still fit in one request.
         Returns an empty string on any failure — context is an enhancement, not
         a blocker: translation proceeds normally when it's missing.
+
+        Starts with a generous excerpt and halves it on context-length errors
+        from the provider, down to ``_MIN_CONTEXT_EXCERPT_CHARS``. This lets us
+        feed as much as the model can handle for big-context providers, and
+        gracefully degrades on smaller-window models or when the prompt+excerpt
+        blows the limit.
         """
         if _STUB_FN is not None:
             return ""
         if not segments:
             return ""
-        excerpt = _sample_segments_excerpt(segments, max_chars=max_chars)
-        if not excerpt.strip():
-            return ""
-        try:
-            import litellm
 
-            messages = [
-                {"role": "system", "content": CONTEXT_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": build_context_user_message(excerpt, source_lang, target_lang),
-                },
-            ]
-            kwargs: dict = dict(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                api_key=self.api_key,
+        current = max_chars
+        while current >= _MIN_CONTEXT_EXCERPT_CHARS:
+            excerpt = _sample_segments_excerpt(segments, max_chars=current)
+            if not excerpt.strip():
+                return ""
+            try:
+                return await self._request_context_brief(
+                    excerpt, target_lang, source_lang,
+                )
+            except _ContextTooLongError as exc:
+                next_size = current // 2
+                if next_size < _MIN_CONTEXT_EXCERPT_CHARS:
+                    log.warning(
+                        "context brief skipped: provider rejected excerpt as too long "
+                        "even at minimum size %d (%s)",
+                        current, exc,
+                    )
+                    return ""
+                log.info(
+                    "context excerpt too long for provider at %d chars; retrying at %d",
+                    current, next_size,
+                )
+                current = next_size
+            except Exception as exc:
+                log.warning("context brief generation failed (%s); proceeding without", exc)
+                return ""
+        return ""
+
+    async def _request_context_brief(
+        self,
+        excerpt: str,
+        target_lang: str,
+        source_lang: str | None,
+    ) -> str:
+        import litellm
+
+        messages = [
+            {"role": "system", "content": CONTEXT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_context_user_message(excerpt, source_lang, target_lang),
+            },
+        ]
+        kwargs: dict = dict(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            api_key=self.api_key,
+        )
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "context request: model=%s temperature=%s api_base=%s excerpt_chars=%d",
+                self.model, self.temperature, self.api_base, len(excerpt),
             )
-            if self.api_base:
-                kwargs["api_base"] = self.api_base
+            log.debug("context system prompt:\n%s", CONTEXT_SYSTEM_PROMPT)
+            log.debug("context user message:\n%s", messages[1]["content"])
+        try:
             resp = await litellm.acompletion(**kwargs)
-            content = (resp.choices[0].message.content or "").strip()
-            # Guard: an over-verbose or empty response still returns safely — the
-            # translator prompt just ignores an empty brief.
-            if len(content) > 2000:
-                content = content[:2000].rstrip() + "…"
-            log.info("document context brief: %s", content.replace("\n", " "))
-            return content
         except Exception as exc:
-            log.warning("context brief generation failed (%s); proceeding without", exc)
-            return ""
+            if _is_context_length_error(exc):
+                raise _ContextTooLongError(str(exc)) from exc
+            raise
+        content = (resp.choices[0].message.content or "").strip()
+        log.debug("context raw response:\n%s", content)
+        if len(content) > _MAX_CONTEXT_BRIEF_CHARS:
+            content = content[:_MAX_CONTEXT_BRIEF_CHARS].rstrip() + "…"
+        log.info("document context brief (%d chars): %s",
+                 len(content), content.replace("\n", " "))
+        return content
 
     async def translate_segments(
         self,
@@ -142,7 +223,16 @@ class LLMClient:
         progress: Callable[[float, str], None] | None = None,
         context: str | None = None,
     ) -> list[Segment]:
-        """Translate segments in-place (sets .translated). Returns same list."""
+        """Translate segments in-place (sets .translated). Returns same list.
+
+        Chunks are processed SEQUENTIALLY in a single conversation per document
+        so the model can reuse earlier terminology decisions in later chunks.
+        Older chunk turns are evicted from history when the conversation grows
+        past ``settings.max_history_tokens`` — the system prompt and the
+        intro/context-brief turn stay pinned. The model is also asked to
+        maintain a small running glossary which we re-inject into every chunk
+        message so pinned terminology survives eviction.
+        """
         # Filter out empty segments (no translation needed).
         translatable = [s for s in segments if s.text and s.text.strip()]
         for s in segments:
@@ -170,29 +260,31 @@ class LLMClient:
         try:
             chunks = chunk_segments(translatable, max_tokens=max_chunk_tokens)
             total = len(chunks)
-            done = 0
-            in_flight = 0
 
-            async def _run_chunk(idx: int, chunk: list[Segment]) -> None:
-                nonlocal done, in_flight
-                async with self.semaphore:
-                    in_flight += 1
-                    if progress:
-                        progress(
-                            done / total,
-                            f"Translating chunk {done + in_flight}/{total}",
-                        )
-                    try:
-                        await self._translate_chunk(
-                            chunk, target_lang, source_lang, context=context,
-                        )
-                    finally:
-                        in_flight -= 1
-                done += 1
+            # Pinned head of the conversation — never evicted.
+            intro_content = build_document_intro_message(target_lang, source_lang, context)
+            history: list[dict[str, str]] = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": intro_content},
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Understood. I'll translate each chunk you send while keeping "
+                        "terminology, register, and style consistent across the whole "
+                        "document, and I'll return JSON keyed by your segment ids."
+                    ),
+                },
+            ]
+            glossary: dict[str, str] = {}
+
+            for idx, chunk in enumerate(chunks):
                 if progress:
-                    progress(done / total, f"Translated {done}/{total} chunks")
-
-            await asyncio.gather(*[_run_chunk(i, c) for i, c in enumerate(chunks)])
+                    progress(idx / total, f"Translating chunk {idx + 1}/{total}")
+                await self._translate_chunk_in_conversation(
+                    chunk, target_lang, history, glossary,
+                )
+                if progress:
+                    progress((idx + 1) / total, f"Translated {idx + 1}/{total} chunks")
         finally:
             # Restore originals + unmask translations.
             for seg, mapping in zip(translatable, maskings, strict=True):
@@ -208,26 +300,97 @@ class LLMClient:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type(LLMError),
     )
-    async def _translate_chunk(
+    async def _translate_chunk_in_conversation(
         self,
         chunk: list[Segment],
         target_lang: str,
-        source_lang: str | None,
-        context: str | None = None,
+        history: list[dict[str, str]],
+        glossary: dict[str, str],
     ) -> None:
-        import litellm
+        """Send one chunk inside the document conversation, mutate history.
 
+        On context-length errors from the provider, evict the oldest chunk
+        turn pair (preserving the pinned intro) and retry. Tenacity retries
+        the whole method on transient LLM errors; the user/assistant pair is
+        only appended to ``history`` on success so retries don't accumulate
+        partial turns.
+        """
         payload = {seg.id: seg.text for seg in chunk}
         payload_json = json.dumps(payload, ensure_ascii=False)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": build_user_message(
-                    payload_json, target_lang, source_lang, context=context,
-                ),
-            },
-        ]
+        user_msg = {
+            "role": "user",
+            "content": build_chunk_user_message(payload_json, glossary),
+        }
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "translate chunk request: model=%s temperature=%s api_base=%s "
+                "segments=%d ids=%s history_turns=%d glossary_entries=%d",
+                self.model, self.temperature, self.api_base,
+                len(chunk), [seg.id for seg in chunk],
+                len(history), len(glossary),
+            )
+            log.debug("translate chunk user message:\n%s", user_msg["content"])
+
+        while True:
+            # Proactively evict if estimated tokens already over budget — saves a
+            # round-trip vs. waiting for a provider rejection.
+            self._enforce_history_budget(history, user_msg)
+            try:
+                resp = await self._call_llm(history + [user_msg])
+                break
+            except _ContextTooLongError as exc:
+                if not self._evict_oldest_pair(history):
+                    raise LLMError(f"context exhausted, nothing left to evict: {exc}") from exc
+                log.info(
+                    "context too long; evicted oldest chunk pair (remaining turns=%d)",
+                    len(history),
+                )
+                continue
+            except Exception as exc:
+                if _is_context_length_error(exc):
+                    if not self._evict_oldest_pair(history):
+                        raise LLMError(f"context exhausted: {exc}") from exc
+                    log.info(
+                        "context error '%s'; evicted oldest chunk pair (remaining turns=%d)",
+                        type(exc).__name__, len(history),
+                    )
+                    continue
+                raise LLMError(f"LLM call failed: {exc}") from exc
+
+        content = resp.choices[0].message.content or ""
+        log.debug("translate raw response:\n%s", content)
+        parsed = _parse_json(content)
+        if parsed is None:
+            raise LLMError(f"Could not parse JSON response: {content[:200]}")
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "translate parsed response: %s",
+                json.dumps(parsed, ensure_ascii=False, indent=2),
+            )
+
+        # Top-level "_glossary" is a running document-wide glossary the model
+        # may append to. We strip it before applying per-segment results so it
+        # isn't mistaken for an unknown segment id.
+        new_glossary = parsed.pop("_glossary", None)
+        if isinstance(new_glossary, dict):
+            for src, tgt in new_glossary.items():
+                if isinstance(src, str) and isinstance(tgt, str) and src.strip():
+                    glossary[src] = tgt
+
+        _apply_response_to_chunk(chunk, parsed, target_lang)
+
+        # Commit the turn to history only after success.
+        history.append(user_msg)
+        history.append({"role": "assistant", "content": content})
+
+    async def _call_llm(self, messages: list[dict[str, str]]):
+        """Single LiteLLM round-trip, with response_format fallback and
+        context-length error translation. Lifts the shared call/fallback logic
+        out of the per-chunk method so eviction can reuse it cleanly.
+        """
+        import litellm
+
         kwargs: dict = dict(
             model=self.model,
             messages=messages,
@@ -236,47 +399,153 @@ class LLMClient:
         )
         if self.api_base:
             kwargs["api_base"] = self.api_base
-        # Request JSON response format on providers that support it.
         kwargs["response_format"] = {"type": "json_object"}
 
         try:
-            resp = await litellm.acompletion(**kwargs)
+            return await litellm.acompletion(**kwargs)
         except Exception as exc:
-            # Fallback without response_format (some providers reject it).
             if "response_format" in str(exc).lower() or "json_object" in str(exc).lower():
                 kwargs.pop("response_format", None)
                 try:
-                    resp = await litellm.acompletion(**kwargs)
+                    return await litellm.acompletion(**kwargs)
                 except Exception as exc2:
-                    raise LLMError(f"LLM call failed: {exc2}") from exc2
-            else:
-                raise LLMError(f"LLM call failed: {exc}") from exc
+                    if _is_context_length_error(exc2):
+                        raise _ContextTooLongError(str(exc2)) from exc2
+                    raise
+            if _is_context_length_error(exc):
+                raise _ContextTooLongError(str(exc)) from exc
+            raise
 
-        content = resp.choices[0].message.content or ""
-        parsed = _parse_json(content)
-        if parsed is None:
-            raise LLMError(f"Could not parse JSON response: {content[:200]}")
+    def _enforce_history_budget(
+        self,
+        history: list[dict[str, str]],
+        pending_user_msg: dict[str, str],
+    ) -> None:
+        """Evict the oldest chunk pair while the estimated tokens of
+        ``history + pending_user_msg`` would exceed ``max_history_tokens``.
 
-        # Match back by id.
-        #   Missing key          -> fall back to original text (LLM lost it).
-        #   Empty string ("")    -> LLM flagged as OCR noise; mark dropped
-        #                           so the renderer can skip it (prompt rule 12).
-        #   Non-empty string     -> normal translated value.
-        for seg in chunk:
-            if seg.id in parsed:
-                translated = parsed[seg.id]
-                if isinstance(translated, str):
-                    if translated == "":
-                        seg.translated = ""
-                        seg.meta["_ocr_noise"] = True
-                    else:
-                        seg.translated = _normalize_target_text(translated, target_lang)
-                else:
-                    log.warning("segment %s has non-string translation; keeping original", seg.id)
-                    seg.translated = seg.meta.get("_original_text", seg.text)
-            else:
-                log.warning("segment %s missing in response; keeping original", seg.id)
-                seg.translated = seg.meta.get("_original_text", seg.text)
+        Only the chunk turns (indices >= 3) are eligible. The pinned head —
+        [system, intro_user, intro_assistant] — is preserved per requirement:
+        "Never evict the system prompt or the document context brief."
+        """
+        budget = getattr(settings, "max_history_tokens", 96000)
+
+        def _total() -> int:
+            total = sum(_approx_tokens(m.get("content", "")) for m in history)
+            total += _approx_tokens(pending_user_msg.get("content", ""))
+            return total
+
+        while _total() > budget:
+            if not self._evict_oldest_pair(history):
+                return  # can't shrink further
+
+    @staticmethod
+    def _evict_oldest_pair(history: list[dict[str, str]]) -> bool:
+        """Drop the oldest user/assistant chunk-turn pair from history.
+
+        The first 3 entries are pinned (system + intro_user + intro_assistant).
+        Chunk turns alternate user/assistant starting at index 3. Returns True
+        if a pair was removed, False if there's nothing evictable.
+        """
+        if len(history) < 5:
+            return False
+        if history[3].get("role") != "user" or history[4].get("role") != "assistant":
+            # History shape unexpectedly diverged — bail out rather than
+            # corrupt the alternation.
+            return False
+        del history[3:5]
+        return True
+
+
+def _apply_response_to_chunk(
+    chunk: list[Segment],
+    parsed: dict,
+    target_lang: str,
+) -> None:
+    """Apply a parsed chunk response onto the chunk's segments.
+
+    Handles all value forms documented in the system prompt:
+      - plain string          -> translation (or "" -> drop as OCR noise)
+      - {"translation": ...}  -> same as plain string
+      - {"skip": true, ...}   -> echo source verbatim, mark _skipped
+      - {"merged_ids": [...]} -> this id carries the combined translation;
+                                  the listed sibling ids get emptied + marked
+                                  _merged_into so renderers drop them.
+      - {"merge_into": "<id>"}-> mark this segment as absorbed into <id>.
+      - {"splits": [...]}     -> join translated sentences for re-insertion.
+    """
+    chunk_ids = {seg.id for seg in chunk}
+    chunk_by_id = {seg.id: seg for seg in chunk}
+    absorbed_into: dict[str, str] = {}  # absorbed_id -> host_id
+
+    def _set_translation(seg: Segment, text: str) -> None:
+        if text == "":
+            seg.translated = ""
+            seg.meta["_ocr_noise"] = True
+        else:
+            seg.translated = _normalize_target_text(text, target_lang)
+
+    def _fallback_to_original(seg: Segment, reason: str) -> None:
+        log.warning("segment %s: %s; keeping original", seg.id, reason)
+        seg.translated = seg.meta.get("_original_text", seg.text)
+
+    for seg in chunk:
+        val = parsed.get(seg.id)
+        if val is None:
+            _fallback_to_original(seg, "missing in response")
+            continue
+
+        if isinstance(val, str):
+            _set_translation(seg, val)
+            continue
+
+        if not isinstance(val, dict):
+            _fallback_to_original(seg, f"non-string/object value ({type(val).__name__})")
+            continue
+
+        merge_into = val.get("merge_into")
+        if isinstance(merge_into, str) and merge_into in chunk_ids and merge_into != seg.id:
+            absorbed_into[seg.id] = merge_into
+            continue
+
+        if val.get("skip") is True:
+            original = seg.meta.get("_original_text", seg.text)
+            tr = val.get("translation")
+            seg.translated = tr if isinstance(tr, str) and tr else original
+            seg.meta["_skipped"] = True
+            continue
+
+        splits = val.get("splits")
+        if isinstance(splits, list) and splits:
+            pieces = [s for s in splits if isinstance(s, str) and s]
+            if pieces:
+                joined = " ".join(_normalize_target_text(p, target_lang) for p in pieces)
+                seg.translated = joined
+                seg.meta["_split"] = True
+                continue
+            # Empty list of non-strings — fall through to the generic path so
+            # we don't silently lose the segment.
+
+        tr = val.get("translation")
+        if isinstance(tr, str):
+            _set_translation(seg, tr)
+            merged_ids = val.get("merged_ids")
+            if isinstance(merged_ids, list):
+                for mid in merged_ids:
+                    if isinstance(mid, str) and mid in chunk_ids and mid != seg.id:
+                        absorbed_into[mid] = seg.id
+            continue
+
+        _fallback_to_original(seg, "object value lacked translation/skip/splits/merge_into")
+
+    # Empty out absorbed segments so renderers drop them (PDF) or render as
+    # blank (DOCX/PPTX/XLSX). Done in a second pass so the host id's own
+    # translation is already populated.
+    for absorbed_id, host_id in absorbed_into.items():
+        absorbed = chunk_by_id[absorbed_id]
+        absorbed.translated = ""
+        absorbed.meta["_ocr_noise"] = True
+        absorbed.meta["_merged_into"] = host_id
 
 
 _ARABIC_ROMAN_ORDINAL = {
