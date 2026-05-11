@@ -52,7 +52,11 @@ async def run_job(
             from .translators.pdf_ocr import maybe_ocr_pdf
 
             _p(0.01, "Running OCR")
-            src = maybe_ocr_pdf(src, wd)
+            # OCR shells out to ocrmypdf via subprocess.run and scans pages with
+            # pymupdf — both block the event loop. Off-load to a worker thread
+            # so the upload response can flush and status polls keep responding
+            # while OCR runs.
+            src = await asyncio.to_thread(maybe_ocr_pdf, src, wd)
 
         # 1. Detect source language (optional, purely for prompting context).
         _p(0.02, "Detecting source language")

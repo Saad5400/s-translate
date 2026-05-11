@@ -1,0 +1,11 @@
+{
+  "name": "s-trans-dev",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,magenta \"PATH=$PWD/.venv/bin:$PATH ./.venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 7860\" \"npm --prefix app/web run dev\"",
+    "build": "npm --prefix app/web run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

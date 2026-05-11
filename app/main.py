@@ -14,11 +14,52 @@ from .api import run_job
 from .config import settings
 from .schemas import OutputMode, TranslationJob
 
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+_configured_level = settings.log_level.upper()
+_is_debug = _configured_level == "DEBUG"
+
+# Terminal always shows INFO+ so the console stays readable. When DEBUG is on,
+# the noisy stuff (full prompts, raw model output) is routed to a file instead.
+_console = logging.StreamHandler()
+_console.setLevel(logging.INFO)
+_console.setFormatter(_fmt)
+
+_handlers: list[logging.Handler] = [_console]
+_log_file_path: Path | None = None
+if _is_debug:
+    from logging.handlers import RotatingFileHandler
+
+    _log_file_path = settings.log_file or (settings.temp_dir / "s-trans.log")
+    _log_file_path.parent.mkdir(parents=True, exist_ok=True)
+    _file = RotatingFileHandler(
+        _log_file_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+    )
+    _file.setLevel(logging.DEBUG)
+    _file.setFormatter(_fmt)
+    _handlers.append(_file)
+
 logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.DEBUG if _is_debug else logging.INFO,
+    handlers=_handlers,
+    force=True,  # override uvicorn's pre-existing root handler under --reload
 )
 log = logging.getLogger("s-trans")
+
+# Force our app loggers to honour LOG_LEVEL even when uvicorn has already
+# attached its own handlers (which leave non-uvicorn loggers at WARNING).
+_effective = logging.DEBUG if _is_debug else logging.getLevelName(_configured_level)
+logging.getLogger("app").setLevel(_effective)
+logging.getLogger("s-trans").setLevel(_effective)
+logging.getLogger().setLevel(_effective)
+
+if _is_debug:
+    try:
+        import litellm
+
+        litellm.set_verbose = True
+    except Exception:
+        pass
+    log.info("debug logs writing to %s (console stays at INFO)", _log_file_path)
 
 
 def create_app() -> FastAPI:
@@ -81,11 +122,12 @@ def create_app() -> FastAPI:
         # language within the TTL window, reuse that job instead of kicking off
         # a new translation. Ignores output_mode — callers can request a
         # different combine via the download endpoint.
+        # Set REUSE_TRANSLATIONS=false to force every upload through the LLM.
         existing = jobs_mod.find_existing_job(
             content_hash=content_hash,
             target_lang=target_lang,
             max_age_seconds=getattr(settings, "job_ttl_seconds", 7 * 24 * 3600),
-        )
+        ) if settings.reuse_translations else None
         if existing is not None:
             # Drop the re-uploaded copy we just wrote — the existing job already
             # owns the input bytes.
