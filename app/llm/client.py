@@ -102,13 +102,15 @@ class LLMClient:
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str | None = None,
         api_base: str | None = None,
         temperature: float = 0.2,
         concurrency: int = settings.concurrent_chunks,
     ) -> None:
         self.model = model
-        self.api_key = api_key
+        # Treat empty strings as "no key" so the request omits the kwarg and
+        # LiteLLM picks the provider-specific env var (DEEPSEEK_API_KEY, ...).
+        self.api_key = api_key or None
         if model.startswith("ollama/") or model.startswith("ollama_chat/"):
             api_base = resolve_ollama_base(api_base)
         self.api_base = api_base

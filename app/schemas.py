@@ -44,7 +44,10 @@ class TranslationJob:
     target_lang: str
     provider: str
     model: str
-    api_key: str
+    # Empty/None means the server will fall back to a provider-specific env
+    # var (e.g. DEEPSEEK_API_KEY) auto-read by LiteLLM. Useful when the deploy
+    # ships a shared key so end users don't need to supply their own.
+    api_key: str | None = None
     api_base: str | None = None
     temperature: float = 0.2
     output_mode: OutputMode = OutputMode.TRANSLATED

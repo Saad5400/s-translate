@@ -105,9 +105,52 @@ def create_app() -> FastAPI:
             _a.create_task(_queue_worker())
         log.info("job queue: %d worker(s)", worker_count)
 
+        # Any job left in "queued" / "running" when the container starts was
+        # interrupted by a restart. The in-memory queue and the runner closure
+        # (which held the user-supplied api_key) are both gone, so mark them
+        # failed instead of leaving them stuck — the user can re-upload.
+        try:
+            for m in jobs_mod.list_jobs(limit=500):
+                if m.status in ("queued", "running"):
+                    jobs_mod.update_status(
+                        m.id,
+                        status="failed",
+                        error="server restarted before job finished",
+                        message="Server restarted — please re-upload",
+                    )
+        except Exception:
+            log.exception("interrupted-job sweep failed")
+
     @fastapi_app.get("/health")
     async def health() -> dict:
         return {"status": "ok"}
+
+    @fastapi_app.get("/api/config")
+    async def public_config() -> dict:
+        """Expose deploy-level knobs the UI needs to render correctly.
+
+        ``shared_providers`` lists providers whose API key is configured
+        server-side via env — for those, the UI doesn't have to require the
+        user to paste their own key. Detection is purely env-var presence;
+        nothing about the key value is leaked.
+        """
+        import os
+
+        provider_env = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            "groq": "GROQ_API_KEY",
+            "mistral": "MISTRAL_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }
+        shared: list[str] = []
+        for pid, envs in provider_env.items():
+            names = (envs,) if isinstance(envs, str) else envs
+            if any(os.environ.get(n) for n in names):
+                shared.append(pid)
+        return {"shared_providers": shared}
 
     # --- Async job-based translate ------------------------------------------
     @fastapi_app.post("/api/jobs")
@@ -117,12 +160,14 @@ def create_app() -> FastAPI:
         target_lang: str = Form(...),
         provider: str = Form(...),
         model: str = Form(...),
-        api_key: str = Form(...),
+        api_key: str | None = Form(None),
         api_base: str | None = Form(None),
         temperature: float = Form(0.2),
         output_mode: str = Form(OutputMode.TRANSLATED.value),
         max_chunk_tokens: int = Form(2500),
     ) -> JSONResponse:
+        # Empty form value → fall back to server-side env (per-provider).
+        api_key = (api_key or "").strip() or None
         try:
             mode = OutputMode(output_mode)
         except ValueError as exc:
@@ -382,12 +427,13 @@ def create_app() -> FastAPI:
         target_lang: str = Form(...),
         provider: str = Form(...),
         model: str = Form(...),
-        api_key: str = Form(...),
+        api_key: str | None = Form(None),
         api_base: str | None = Form(None),
         temperature: float = Form(0.2),
         output_mode: str = Form(OutputMode.TRANSLATED.value),
         max_chunk_tokens: int = Form(2500),
     ) -> FileResponse:
+        api_key = (api_key or "").strip() or None
         upload_dir = settings.temp_dir / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         safe_name = Path(file.filename or "upload").name

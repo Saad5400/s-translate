@@ -87,11 +87,30 @@ export function saveRoute(r: { name: string; jobId?: string }) {
   try { localStorage.setItem(ROUTE_KEY, JSON.stringify(r)); } catch { /* ignore */ }
 }
 
+// Providers whose API key is configured on the server — for those, the UI
+// drops the "key required" gate and lets the user submit an empty key.
+// Populated once at app boot from GET /api/config.
+let _sharedProviders: ReadonlySet<string> = new Set();
+
+export function setSharedProviders(ids: readonly string[]): void {
+  _sharedProviders = new Set(ids);
+  notifyStore();
+}
+
+export function getSharedProviders(): ReadonlySet<string> {
+  return _sharedProviders;
+}
+
+export function providerNeedsKey(providerId: string): boolean {
+  // Ollama is always keyless; everything else needs a key unless the server
+  // advertises a shared one for that provider.
+  if (providerId === "ollama") return false;
+  return !_sharedProviders.has(providerId);
+}
+
 /** Does the config have the minimum needed to start a translation? */
 export function isConfigured(c: Config): boolean {
-  // Ollama doesn't need a key but does need api_base
-  const needsKey = c.providerId !== "ollama";
-  if (needsKey && !c.apiKey.trim()) return false;
+  if (providerNeedsKey(c.providerId) && !c.apiKey.trim()) return false;
   if (!c.model.trim()) return false;
   return true;
 }

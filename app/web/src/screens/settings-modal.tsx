@@ -13,7 +13,7 @@ import { Input, Textarea } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
 import { SecretField } from "@/components/ui/secret-field";
-import { type Config, isConfigured } from "@/lib/store";
+import { type Config, isConfigured, providerNeedsKey, useStoreSubscription } from "@/lib/store";
 import { PROVIDERS, findProvider } from "@/lib/data";
 
 interface Props {
@@ -32,8 +32,11 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
     if (open) setLocal(cfg);
   }, [open, cfg]);
 
+  useStoreSubscription();
   const provider = findProvider(local.providerId);
   const valid = isConfigured(local);
+  const sharedKeyAvailable =
+    local.providerId !== "ollama" && !providerNeedsKey(local.providerId);
 
   const providerOptions: ComboboxOption[] = PROVIDERS.map((p) => ({
     value: p.id,
@@ -121,11 +124,23 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
               />
             </div>
             <div className="grid gap-2">
-              <Label>مفتاح الـ API</Label>
+              <Label>
+                مفتاح الـ API
+                {sharedKeyAvailable && (
+                  <span className="text-paper-3 text-[11px] font-mono">
+                    {" "}
+                    · اختياري
+                  </span>
+                )}
+              </Label>
               <SecretField
                 value={local.apiKey}
                 onChange={(v) => setLocal({ ...local, apiKey: v })}
-                placeholder={provider.keyHint || "sk-…"}
+                placeholder={
+                  sharedKeyAvailable
+                    ? "اتركه فارغًا لاستخدام مفتاح الخادم"
+                    : provider.keyHint || "sk-…"
+                }
               />
             </div>
             <div className="grid gap-2">

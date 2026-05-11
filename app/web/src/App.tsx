@@ -16,10 +16,12 @@ import {
   loadRoute,
   saveRoute,
   isConfigured,
+  setSharedProviders,
   type Config,
 } from "@/lib/store";
 import {
   createJob,
+  fetchServerConfig,
   getJob,
   getJobPreview,
   listJobs,
@@ -79,6 +81,12 @@ function AppInner() {
 
   // Initial data load
   React.useEffect(() => {
+    // Server config tells us which providers have a shared key — needed
+    // before the configure screen renders so the key field can drop its
+    // "required" badge when applicable.
+    fetchServerConfig()
+      .then((c) => setSharedProviders(c.shared_providers))
+      .catch(() => {});
     listJobs(50)
       .then((list) => setJobs(list))
       .catch(() => {});

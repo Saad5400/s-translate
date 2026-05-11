@@ -3,6 +3,22 @@
 
 export type BackendJobStatus = "queued" | "running" | "done" | "failed";
 
+export interface ServerConfig {
+  /** Provider IDs for which the deploy already has an API key configured
+   *  server-side — the UI can drop the "key required" gate for these. */
+  shared_providers: string[];
+}
+
+export async function fetchServerConfig(): Promise<ServerConfig> {
+  try {
+    const r = await fetch("/api/config");
+    if (!r.ok) return { shared_providers: [] };
+    return (await r.json()) as ServerConfig;
+  } catch {
+    return { shared_providers: [] };
+  }
+}
+
 export interface JobMeta {
   id: string;
   status: BackendJobStatus;
@@ -25,6 +41,7 @@ export interface CreateJobInput {
   target_lang: string;
   provider: string;
   model: string;
+  /** Empty string means "use the server's shared key for this provider". */
   api_key: string;
   api_base?: string;
   temperature: number;

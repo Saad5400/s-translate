@@ -15,7 +15,7 @@ import {
   findLang,
   findProvider,
 } from "@/lib/data";
-import type { Config } from "@/lib/store";
+import { providerNeedsKey, useStoreSubscription, type Config } from "@/lib/store";
 import type { StagedFile } from "./upload";
 import { fmtSize, cn } from "@/lib/utils";
 
@@ -30,12 +30,16 @@ interface Props {
 }
 
 export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isRtl, starting = false }: Props) {
+  // Re-render when /api/config arrives so the key field can flip from required
+  // to optional once we learn the server has a shared key for this provider.
+  useStoreSubscription();
   const provider = findProvider(cfg.providerId);
   const targetLang = findLang(cfg.target);
   const BackIcon = isRtl ? ArrowRight : ArrowLeft;
   const ForwardIcon = isRtl ? ArrowLeft : ArrowRight;
 
-  const needsKey = cfg.providerId !== "ollama";
+  const needsKey = providerNeedsKey(cfg.providerId);
+  const sharedKeyAvailable = cfg.providerId !== "ollama" && !needsKey;
   const canStart =
     !!cfg.target &&
     !!cfg.shape &&
@@ -231,13 +235,27 @@ export function ConfigureScreen({ cfg, setCfg, stagedFiles, onBack, onStart, isR
               <span className="inline-flex items-center gap-1.5">
                 <KeyRound className="h-3 w-3" />
                 مفتاح الـ API
+                {sharedKeyAvailable && (
+                  <span className="text-paper-3 text-[11px] font-mono">
+                    · اختياري
+                  </span>
+                )}
               </span>
             </Label>
             <SecretField
               value={cfg.apiKey}
               onChange={(v) => setCfg({ ...cfg, apiKey: v })}
-              placeholder={provider.keyHint || "sk-…"}
+              placeholder={
+                sharedKeyAvailable
+                  ? "اتركه فارغًا لاستخدام مفتاح الخادم المشترك"
+                  : provider.keyHint || "sk-…"
+              }
             />
+            {sharedKeyAvailable && (
+              <div className="text-[12px] text-paper-3">
+                الخادم يوفّر مفتاحًا مشتركًا لهذا المزوِّد؛ اتركه فارغًا للاستفادة منه، أو أدخل مفتاحك الخاص لتجاوزه.
+              </div>
+            )}
           </div>
 
           <div className="grid gap-2">
