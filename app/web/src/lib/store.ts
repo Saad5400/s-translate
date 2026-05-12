@@ -97,11 +97,15 @@ export function saveRoute(r: { name: string; jobId?: string }) {
 }
 
 // The provider this deploy has a shared API key for, populated once at app
-// boot from GET /api/config. Null means the user must bring their own key.
+// boot from GET /api/config. Null means no shared key. `_loaded` flips true
+// the moment the fetch resolves (success or failure) so UI can tell apart
+// "still fetching" from "fetched, no shared key".
 let _sharedKey: SharedKey | null = null;
+let _sharedKeyLoaded = false;
 
 export function setSharedKey(s: SharedKey | null): void {
   _sharedKey = s;
+  _sharedKeyLoaded = true;
   notifyStore();
 }
 
@@ -109,18 +113,22 @@ export function getSharedKey(): SharedKey | null {
   return _sharedKey;
 }
 
-/** Does the user's current config cover the shared key (i.e. they've picked
- *  shared mode AND the server still advertises a key for their provider)? */
+export function isSharedKeyLoaded(): boolean {
+  return _sharedKeyLoaded;
+}
+
+/** Is the user in "use shared key" mode? Trust the persisted choice — if
+ *  the server later removes the shared key, the request will fail with a
+ *  clear 401 and the user can re-open settings to switch. */
 export function usingSharedKey(c: Config): boolean {
-  if (c.keyMode !== "shared") return false;
-  return !!_sharedKey && _sharedKey.provider === c.providerId;
+  return c.keyMode === "shared";
 }
 
 /** Does the config have the minimum needed to start a translation? */
 export function isConfigured(c: Config): boolean {
   if (!c.model.trim()) return false;
   if (c.providerId === "ollama") return true; // keyless
-  if (usingSharedKey(c)) return true;          // server covers the key
+  if (c.keyMode === "shared") return true;     // server covers the key
   return !!c.apiKey.trim();
 }
 

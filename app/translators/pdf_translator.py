@@ -1039,12 +1039,33 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
         page_bg = np.array([255, 255, 255], dtype=np.uint8)
 
     box_fills: list[np.ndarray] = []
-    for _, (ix0, iy0, ix1, iy1) in scaled_boxes:
+    draw_boxes: list[tuple[int, int, int, int]] = []
+    centers = [
+        ((bx0 + bx1) / 2.0, (by0 + by1) / 2.0)
+        for _, (bx0, by0, bx1, by1) in scaled_boxes
+    ]
+    for idx, (_, (ix0, iy0, ix1, iy1)) in enumerate(scaled_boxes):
         interior = _sample_bbox_interior_bg(arr, (ix0, iy0, ix1, iy1))
         local = _sample_local_bg(arr, text_mask, (ix0, iy0, ix1, iy1), ring=16)
         fill = interior if interior is not None else (local if local is not None else page_bg)
-        arr[iy0:iy1, ix0:ix1] = fill
+        draw_box = (ix0, iy0, ix1, iy1)
+        if _is_colored_fill(fill):
+            expanded = _expand_uniform_fill_box(arr, draw_box, fill)
+            foreign_centers = 0
+            ex0, ey0, ex1, ey1 = expanded
+            for cidx, (cx, cy) in enumerate(centers):
+                if cidx == idx:
+                    continue
+                if ex0 <= cx <= ex1 and ey0 <= cy <= ey1:
+                    foreign_centers += 1
+                    if foreign_centers > 0:
+                        expanded = draw_box
+                        break
+            draw_box = expanded
+        dx0, dy0, dx1, dy1 = draw_box
+        arr[dy0:dy1, dx0:dx1] = fill
         box_fills.append(fill)
+        draw_boxes.append(draw_box)
 
     # BEFORE flipping, capture every Latin-text-shaped region on the page
     # — both on plain background and inside illustrations/diagrams — so
@@ -1097,7 +1118,8 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
 
     draw = ImageDraw.Draw(img)
     font_cache: dict[tuple[str, int, bool, bool], object] = {}
-    for (seg, (ix0, iy0, ix1, iy1)), box_fill in zip(scaled_boxes, box_fills):
+    for (seg, _), box_fill, draw_box in zip(scaled_boxes, box_fills, draw_boxes):
+        ix0, iy0, ix1, iy1 = draw_box
         text = (seg.translated or seg.text or "").strip()
         if not text:
             continue
@@ -1118,6 +1140,7 @@ def _render_page_via_pil(page, segs, *, target_lang: str, rtl: bool, dpi: int = 
                 rotation = 90
 
         color = _int_to_rgb_tuple(seg.meta.get("color", 0))
+        color = _ensure_text_contrast(color, box_fill)
         font_size = max(8, int(round(float(seg.meta.get("font_size", 11.0)) * scale)))
         bold = bool(seg.meta.get("bold"))
         italic = bool(seg.meta.get("italic"))
@@ -1489,6 +1512,33 @@ def _is_colored_fill(fill) -> bool:
     return max(abs(255 - r), abs(255 - g), abs(255 - b)) > 22
 
 
+def _luminance(rgb: tuple[int, int, int] | list[int] | object) -> float:
+    try:
+        r, g, b = (int(v) for v in rgb[:3])
+    except Exception:
+        return 255.0
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _ensure_text_contrast(
+    color: tuple[int, int, int],
+    fill,
+) -> tuple[int, int, int]:
+    """Preserve source colour when it is readable, but repair obvious
+    dark-on-dark or light-on-light failures on coloured containers."""
+    try:
+        fr, fg, fb = (int(v) for v in fill[:3])
+    except Exception:
+        return color
+    fill_l = _luminance((fr, fg, fb))
+    text_l = _luminance(color)
+    if fill_l < 110 and text_l < 150:
+        return (255, 255, 255)
+    if fill_l > 210 and text_l > 230:
+        return (32, 32, 32)
+    return color
+
+
 def _sample_local_bg(arr, text_mask, box, ring: int = 16):
     """Median colour of pixels in a ``ring``-wide frame OUTSIDE ``box`` that
     are NOT inside any other text bbox. Returns a uint8 RGB array or None
@@ -1549,6 +1599,71 @@ def _sample_bbox_interior_bg(arr, box):
     if cluster.size == 0:
         return None
     return np.median(cluster, axis=0).astype(np.uint8)
+
+
+def _expand_uniform_fill_box(arr, box, fill, max_expand_px: int = 160):
+    """Grow an isolated coloured text bbox to its surrounding container when
+    adjacent strips are visually the same fill colour.
+
+    This targets callouts/badges where OCR captured only the text area rather
+    than the full rounded rectangle, while avoiding large multi-text panels
+    whose expanded container would swallow neighbouring segments.
+    """
+    import numpy as np
+
+    h, w = arr.shape[:2]
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return box
+
+    fill = np.asarray(fill[:3], dtype=np.float32)
+
+    def strip_matches(side: str, rect) -> bool:
+        rx0, ry0, rx1, ry1 = rect
+        band = 4
+        if side == "left":
+            sx0, sx1 = max(0, rx0 - band), rx0
+            sy0, sy1 = ry0, ry1
+        elif side == "right":
+            sx0, sx1 = rx1, min(w, rx1 + band)
+            sy0, sy1 = ry0, ry1
+        elif side == "top":
+            sx0, sx1 = rx0, rx1
+            sy0, sy1 = max(0, ry0 - band), ry0
+        else:
+            sx0, sx1 = rx0, rx1
+            sy0, sy1 = ry1, min(h, ry1 + band)
+        if sx1 - sx0 < 2 or sy1 - sy0 < 2:
+            return False
+        strip = arr[sy0:sy1, sx0:sx1, :3].reshape(-1, 3).astype(np.float32)
+        if strip.size == 0:
+            return False
+        dist = np.abs(strip - fill).mean(axis=1)
+        near = dist <= 20.0
+        if near.mean() < 0.72:
+            return False
+        return True
+
+    rect = [int(x0), int(y0), int(x1), int(y1)]
+    grew = True
+    spent = 0
+    while grew and spent < max_expand_px:
+        grew = False
+        if rect[0] > 0 and strip_matches("left", rect):
+            rect[0] = max(0, rect[0] - 4)
+            grew = True
+        if rect[2] < w and strip_matches("right", rect):
+            rect[2] = min(w, rect[2] + 4)
+            grew = True
+        if rect[1] > 0 and strip_matches("top", rect):
+            rect[1] = max(0, rect[1] - 4)
+            grew = True
+        if rect[3] < h and strip_matches("bottom", rect):
+            rect[3] = min(h, rect[3] + 4)
+            grew = True
+        if grew:
+            spent += 4
+    return tuple(rect)
 
 
 def _load_pil_font(target_lang: str, size: int, bold: bool, italic: bool, cache: dict):
@@ -1650,14 +1765,6 @@ def _draw_text_in_bbox(
     # tend to be wider than Latin at the same point size, and also carry
     # longer lexical equivalents, so wrapping into the exact source-width
     # frequently produces 1-2-word narrow columns in place of a natural
-    # paragraph. Widen the effective wrap width by a small factor for RTL
-    # targets so the paragraph breathes out to match its container.
-    # Downstream logic still anchors text to the original bbox's
-    # right-edge (RTL) or left-edge (LTR), so the text just flows a bit
-    # further into the adjacent whitespace — it does not collide with
-    # neighbouring segments (those have their own bboxes/redactions).
-    if rtl and not constrain_to_box:
-        box_w = int(box_w * 1.25)
     x0, y0, x1, y1 = box
     direction = "rtl" if rtl and _contains_rtl(text) else "ltr"
     features = ["kern", "liga"]
@@ -1752,7 +1859,15 @@ def _draw_text_in_bbox(
         and len(wrapped_lines) > len(forced_lines)
         and total_words_in_source <= 4
     ):
-        wrapped_lines = list(forced_lines)
+        forced_ok = True
+        for forced in forced_lines:
+            forced_plain = _strip_bidi_controls(forced)
+            forced_dir = "rtl" if rtl and _contains_rtl(forced_plain) else "ltr"
+            if _text_width(draw, forced_plain, font, forced_dir, features, lang) > int(box_w * 1.12):
+                forced_ok = False
+                break
+        if forced_ok:
+            wrapped_lines = list(forced_lines)
     if not wrapped_lines:
         return
     line_h = _line_height(font)
@@ -1768,22 +1883,24 @@ def _draw_text_in_bbox(
     if constrain_to_box:
         y = max(y0, y)
     for line in wrapped_lines:
-        tw = _text_width(draw, line, font, direction, features, lang)
+        paint = _strip_bidi_controls(line)
+        line_dir = "rtl" if rtl and _contains_rtl(paint) else "ltr"
+        tw = _text_width(draw, paint, font, line_dir, features, lang)
         x = x1 if rtl else x0
         try:
             kwargs = dict(
                 font=font, fill=color,
-                direction=direction, features=features, language=lang,
+                direction=line_dir, features=features, language=lang,
             )
             if rtl:
                 kwargs["anchor"] = "ra"
-            draw.text((x, y), line, **kwargs)
+            draw.text((x, y), paint, **kwargs)
         except Exception:
             try:
                 if rtl:
-                    draw.text((x - tw, y), line, font=font, fill=color)
+                    draw.text((x - tw, y), paint, font=font, fill=color)
                 else:
-                    draw.text((x, y), line, font=font, fill=color)
+                    draw.text((x, y), paint, font=font, fill=color)
             except Exception:
                 pass
         y += line_h
@@ -1820,6 +1937,10 @@ def _protect_ltr_runs_for_bidi(text: str) -> str:
         return f"\u2066{token}\u2069"
 
     return _LTR_RUN_RE.sub(repl, text)
+
+
+def _strip_bidi_controls(text: str) -> str:
+    return (text or "").replace("\u2066", "").replace("\u2069", "").replace("\u200e", "")
 
 
 def _draw_rotated_text_in_bbox(

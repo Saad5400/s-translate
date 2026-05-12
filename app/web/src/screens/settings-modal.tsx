@@ -17,6 +17,7 @@ import {
   type Config,
   getSharedKey,
   isConfigured,
+  isSharedKeyLoaded,
   useStoreSubscription,
 } from "@/lib/store";
 import { PROVIDERS, findProvider } from "@/lib/data";
@@ -34,24 +35,40 @@ interface Props {
 export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: Props) {
   useStoreSubscription();
   const shared = getSharedKey();
+  const sharedLoaded = isSharedKeyLoaded();
   const sharedProvider = shared ? findProvider(shared.provider) : null;
 
   // Two views inside the modal:
   //   "gate" — just the two big choice buttons (only when shared is available)
   //   "form" — the full provider/model/key/api_base/glossary form + save
-  // Default to gate whenever shared is available so the user can switch back
-  // and forth across visits without digging.
-  const [view, setView] = React.useState<"gate" | "form">(
-    shared ? "gate" : "form"
-  );
+  //   null   — server config hasn't resolved yet; render nothing inside
+  //            so we don't show the wrong view and then flip mid-interaction.
+  const [view, setView] = React.useState<"gate" | "form" | null>(null);
   const [local, setLocal] = React.useState<Config>(cfg);
 
+  // Reset view + local copy every time the modal transitions to open. Track
+  // a `lastOpenTick` so we only reset on the open transition, not on every
+  // cfg change while the modal is being used.
+  const wasOpenRef = React.useRef(false);
   React.useEffect(() => {
-    if (open) {
+    if (open && !wasOpenRef.current) {
       setLocal(cfg);
+      // If we already know the server's shared-key status, pick the view
+      // immediately. Otherwise leave it as null and let the next effect
+      // fill it in once the fetch resolves.
+      setView(sharedLoaded ? (shared ? "gate" : "form") : null);
+    }
+    wasOpenRef.current = open;
+  }, [open, cfg, sharedLoaded, shared]);
+
+  // Once shared status loads (after the modal already opened), fill in the
+  // view. This only runs while view is still null — we never override a
+  // user choice mid-session.
+  React.useEffect(() => {
+    if (open && view === null && sharedLoaded) {
       setView(shared ? "gate" : "form");
     }
-  }, [open, cfg, shared]);
+  }, [open, view, sharedLoaded, shared]);
 
   const provider = findProvider(local.providerId);
   const valid = isConfigured(local);
@@ -122,7 +139,13 @@ export function SettingsModal({ open, onOpenChange, cfg, setCfg, enforceGate }: 
           )}
         </DialogHeader>
 
-        {view === "gate" && shared && sharedProvider ? (
+        {view === null ? (
+          <DialogBody>
+            <div className="py-8 text-center text-paper-3 text-[13px]">
+              جارٍ التحميل…
+            </div>
+          </DialogBody>
+        ) : view === "gate" && shared && sharedProvider ? (
           <DialogBody>
             <div className="grid md:grid-cols-2 gap-3">
               <button
